@@ -24,8 +24,8 @@ class _Method:
         name = self.name[4:]
         return str(self.configobj[name])
 
-
 class Config(object):
+    #config object
     def __init__(self):
         try:
             cf = ConfigParser()
