@@ -1,4 +1,4 @@
 fuse_for_kuaipan
 ================
 
-A network driver fuse Implementation for kingsoft's kuaipan base on kuaipan's api
+A network driver's fuse Implementation base on kingsoft's kuaipan api
