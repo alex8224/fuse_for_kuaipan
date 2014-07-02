@@ -481,5 +481,8 @@ if __name__ == "__main__":
         print('usage: %s <mountpoint>' % argv[0])
         exit(1)
 
-    fuse = FUSE(KuaiPanFuse(), argv[1], foreground=False, nothreads=False, debug=False)
+    # fuse = FUSE(KuaiPanFuse(), argv[1], foreground=False, nothreads=False, debug=False)
+    gid, uid = os.getgid(), os.getuid()
+    opts = {"gid":gid, "uid":uid}
+    fuse = FUSE(KuaiPanFuse(), argv[1], foreground=False, nothreads=False, debug=False, gid=os.getgid(), uid=os.getuid(), allow_other=True, umask='0000')
 
