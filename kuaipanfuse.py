@@ -2,11 +2,11 @@
 # -*-coding:utf-8 -*-
 
 #********************************************************************************
-# Author: tony - birdaccp@gmail.com alex8224@gmail.com
-# Create by: 2013-08-17 12:53
-# Last modified: 2014-07-01
-# Filename: kuanpanfuse.py
-# Description: 实现快盘的ＡＰＩ,可以实现文件的异步上传, 下载，浏览，目录操作
+#Author: tony - birdaccp@gmail.com alex8224@gmail.com
+#Create by: 2013-08-17 12:53
+#Last modified: 2014-07-01
+#Filename: kuanpanfuse.py
+#Description: 实现快盘的ＡＰＩ,可以实现文件的异步上传, 下载，浏览，目录操作
 # 缩略图和版本功能未实现
 #********************************************************************************
 
@@ -34,7 +34,7 @@ TYPE_FILE= (S_IFREG | 0644 )
 
 CACHE_PATH = "/tmp/"
 
-ROOT_ST_INFO = { 
+ROOT_ST_INFO = {
         "st_mtime": common.timestamp(),
         "st_mode":  TYPE_DIR,
         "st_size":  4096,
@@ -87,7 +87,7 @@ class TaskPool(object):
         self.taskclass = {"upload":WriteTask,"download":DownloadTask}
 
     def upload_file(self, hashpath, *args):
-        return self.__new_task("upload", hashpath, *args) 
+        return self.__new_task("upload", hashpath, *args)
 
     def download_file(self, hashpath, *args):
         return self.__new_task("download", hashpath, *args)
@@ -176,14 +176,14 @@ class WriteTask(Thread, Future):
         self.path = path
         self.filename = filename
         self.fullpath = CACHE_PATH + hashpath
-        self.writebytes = 0 
+        self.writebytes = 0
         self.cmd = Queue(1000)
         self.cmd.put(("start_upload_file",(data, offset)))
         self.notify = notify
         self.clsname = "_" + self.__class__.__name__
 
     def sendmesg(self, cmd):
-        self.cmd.put(cmd) 
+        self.cmd.put(cmd)
 
 
     def start_upload_file(self, data, offset):
@@ -237,7 +237,7 @@ class WriteTask(Thread, Future):
         finally:
             self.sendmesg("quit")
             self.is_finished = True
-            self.notify(self.result)    
+            self.notify(self.result)
             self.__dropcache()
 
     def __dropcache(self):
@@ -245,9 +245,9 @@ class WriteTask(Thread, Future):
             os.unlink(self.fullpath)
         except Exception,e:
             logger.error(e)
-           
+
     def __callmethod(self, mesg):
-        methodname, args = mesg 
+        methodname, args = mesg
         internalmethod = self.clsname + "__" + methodname
         if hasattr(self, internalmethod):
             logger.debug("call method %s " % (methodname, ))
@@ -268,7 +268,7 @@ class WriteTask(Thread, Future):
                 pass
 
 class KuaiPanFuse(LoggingMixIn, Operations):
-    
+
     def __init__(self):
         self.api = KuaipanAPI()
         self.root = "."
@@ -307,13 +307,13 @@ class KuaiPanFuse(LoggingMixIn, Operations):
                         "type":     finfo["type"]
                     }
             self.fileprops[path_as_key] = st_info
- 
+
         allfiles = ['.','..']
 
         for remotefile in metadata_for_dir["files"]:
             allfiles.append(remotefile["name"])
 
-        self.rootfiles = allfiles 
+        self.rootfiles = allfiles
         return allfiles
 
     def readdir(self, path, fh):
@@ -340,11 +340,11 @@ class KuaiPanFuse(LoggingMixIn, Operations):
                 logger.debug("创建下载任务, require %d bytes" % size)
                 downloadtask = self.taskpool.download_file(hashpath, self.api, path)
                 return downloadtask.wait_data(size)
-            
+
         except Exception ,e:
             logger.error(e)
             import traceback;traceback.print_exc()
-     
+
     def unlink(self, path):
         result = self.api.delete(path)
         if result.status_code == 200:
@@ -404,7 +404,7 @@ class KuaiPanFuse(LoggingMixIn, Operations):
                     filter(
                         lambda dirname:dirname.startswith(path), self.fileprops.keys())
                     ) > 1:
-               raise FuseOSError(ENOTEMPTY) 
+               raise FuseOSError(ENOTEMPTY)
             else:
                del self.fileprops[path]
 
@@ -439,7 +439,7 @@ class KuaiPanFuse(LoggingMixIn, Operations):
                 writetask.push_upload_file(data, offset)
             else:
                 self.taskpool.upload_file(hashpath, self.api, path, filename, data, offset)
-            return len(data)    
+            return len(data)
         except Exception, e:
             logger.error(e)
             raise FuseOSError(ENOENT)
@@ -454,7 +454,7 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         uploadtask = self.taskpool.query_upload_task(hashpath)
         if uploadtask:
             uploadtask.end_upload_file()
-        
+
         downloadtask = self.taskpool.query_download_task(hashpath)
         if downloadtask:
             downloadtask.end_download_file()

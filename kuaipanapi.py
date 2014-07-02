@@ -1,12 +1,13 @@
 #!/usr/bin/python
 # -*-coding:utf-8 -*-
 #****************************************************
-# Author: tony - birdaccp@gmail.com alex8224@gmail.com
-# Create by: 2013-08-17 10:33
-# Last modified: 2013-08-17 10:33
-# Filename: kuaipan.py
-# Description:
+#Author: tony - birdaccp@gmail.com alex8224@gmail.com
+#Create by: 2013-08-17 10:33
+#Last modified:2014-07-02 15:01:35
+#Filename: kuaipan.py
+#Description:
 #****************************************************
+
 
 import os
 import sys
@@ -53,7 +54,7 @@ class KuaipanAPI(object):
         authorize_url = self.authorize()
         auth_code = self.get_auth_code(authorize_url)
         self.access_token(auth_code)
- 
+
     def request_token(self, callback=None):
         sig_req_url = self.__get_sig_url("request_token_base_url",has_oauth_token=False)
         rf = requests.get(sig_req_url)
@@ -107,7 +108,7 @@ class KuaipanAPI(object):
                 parameters[k] = v
 
         base_url = method_url.get(method, None)
-        
+
         if base_url:
             if urlsuffix:
                 base_url = str(base_url % urlsuffix)
@@ -139,7 +140,7 @@ class KuaipanAPI(object):
     def download_file(self, filepath):
         attach = {"path":filepath, "root":"app_folder"}
         sig_req_url = self.__get_sig_url("download", attachdata=attach)
-    
+
         try:
             req_download = requests.get(sig_req_url,stream=True)
             fd = req_download.raw
@@ -161,7 +162,7 @@ class KuaipanAPI(object):
         attach = {"root":"app_folder", "path":folder}
         sig_req_url = self.__get_sig_url("create_folder", attachdata=attach)
         return requests.get(sig_req_url)
-        
+
     def upload(self, uploadpath, name):
 
         def get_upload_locate():
