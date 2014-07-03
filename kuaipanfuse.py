@@ -17,6 +17,7 @@ import copy
 import signal
 import common
 import logging
+import traceback
 from sys import argv
 from shutil import move
 from hashlib import sha1
@@ -24,6 +25,7 @@ from functools import partial
 from kuaipanapi import KuaipanAPI
 from Queue import Queue, Empty
 from stat import S_IFDIR, S_IFREG
+from kuaipanapi import OpenAPIError
 from threading import Thread, Event,  RLock as Lock
 from errno import ENOENT,EROFS, ENOTEMPTY, EEXIST, EIO
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
@@ -132,37 +134,44 @@ class TaskPool(object):
 
 class DownloadTask(Future):
 
-    def __init__(self, api, hashpath, path, notify):
+    def __init__(self, api, hashpath, path, bufsize, notify):
         Future.__init__(self)
         self.api = api
         self.path = path
+        self.hashpath = hashpath
         self.notify = notify
         self.waiter = Event()
         self.isfirst = True
+        self.bufsize = bufsize
+        self.downloadbytes = 0
         self.lock = Lock()
 
-    def wait_data(self,size):
+    def wait_data(self,size=None):
         '''等待达到指定的ｓｉｚｅ后返回给调用端'''
         self.waiter.wait()
         with self.lock:
             if self.isfirst:
-                firstdata = self.buffgen.send(None)
+                self.buffgen.send(None)
+                firstdata = self.buffgen.send(self.bufsize)
+                self.downloadbytes += len(firstdata)
                 self.isfirst = False
                 return firstdata
             else:
                 try:
                     data = self.buffgen.send(size)
+                    self.downloadbytes += len(data)
                     return data
                 except StopIteration:
                     self.buffgen.close()
 
     def end_download_file(self):
-            self.notify()
+        logger.debug("file %s download completed, %d bytes downloaded, key %s" % (self.path, self.downloadbytes, self.hashpath))
+        self.notify()
 
     def start(self):
         '''调用下载文件的ＡＰＩ，在数据可用时通知调用端开始下载数据'''
-        logger.debug("start download %s =================" % self.path)
-        self.buffgen = self.api.download_file(self.path)
+        logger.debug("start download %s" % self.path)
+        self.buffgen = self.api.download_file(self.path, self.bufsize)
         self.waiter.set()
 
 class WriteTask(Thread, Future):
@@ -191,7 +200,6 @@ class WriteTask(Thread, Future):
 
     def __start_upload_file(self, data, offset):
         '''启动缓存文件的写入'''
-        logger.debug("====================call start_upload_file======================")
         if os.path.exists(self.fullpath):
             os.unlink(self.fullpath)
 
@@ -206,8 +214,6 @@ class WriteTask(Thread, Future):
 
     def __push_upload_file(self, data, offset):
         '''将数据添加到对应的缓存文件中'''
-
-        logger.debug("====================call push_upload_file======================")
         if os.path.exists(self.fullpath):
             with open(self.fullpath, "a") as f:
                 f.seek(offset)
@@ -221,7 +227,6 @@ class WriteTask(Thread, Future):
     def __end_upload_file(self):
         '''开始真正的上传文件'''
         try:
-            #import pdb;pdb.set_trace()
             logger.debug("start upload file %s to kuaipan server" % self.path)
             uploadpath = os.path.dirname(self.path)
             destpath = CACHE_PATH + self.filename
@@ -277,6 +282,16 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         self.taskpool = TaskPool()
         self.rootfiles = self.listdir("/")
 
+    def __call__(self, op, *args):
+        try:
+            return super(KuaiPanFuse, self).__call__(op, *args)
+        except Exception ,e:
+            logger.error(traceback.format_exc())
+            if isinstance(e, OpenAPIError):
+                raise FuseOSError(EIO)
+            else:
+                raise
+
     def listdir(self, path="/testupload2"):
         '''
         [{u'create_time': u'2014-06-26 14:50:00',
@@ -317,7 +332,6 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         return allfiles
 
     def readdir(self, path, fh):
-        # import pdb;pdb.set_trace()
         return self.rootfiles
 
     def getattr(self, path, fh=None):
@@ -328,22 +342,16 @@ class KuaiPanFuse(LoggingMixIn, Operations):
             raise FuseOSError(ENOENT)
 
     def read(self, path, size, offset, fh):
-        # import pdb;pdb.set_trace()
-        try:
-            hashpath = sha1(path.encode("utf-8")).hexdigest().strip()
-            downloadtask = self.taskpool.query_download_task(hashpath)
-            if downloadtask:
-                #等待数据
-                logger.debug("再次进入等待下载的数据")
-                return downloadtask.wait_data(size)
-            else:
-                logger.debug("创建下载任务, require %d bytes" % size)
-                downloadtask = self.taskpool.download_file(hashpath, self.api, path)
-                return downloadtask.wait_data(size)
-
-        except Exception ,e:
-            logger.error(e)
-            import traceback;traceback.print_exc()
+        hashpath = sha1(path.encode("utf-8")).hexdigest().strip()
+        downloadtask = self.taskpool.query_download_task(hashpath)
+        if downloadtask:
+            data = downloadtask.wait_data(size)
+            logger.debug("ReEnter wait_data for file %s , got %d bytes" % (hashpath,len(data)))
+            return data
+        else:
+            logger.debug("Create download task%s, require %d bytes" % (hashpath, size))
+            downloadtask = self.taskpool.download_file(hashpath, self.api, path, size)
+            return downloadtask.wait_data()
 
     def unlink(self, path):
         result = self.api.delete(path)
@@ -431,20 +439,14 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         return self.fd
 
     def write(self, path, data, offset, ph):
-        try:
-            hashpath = sha1(path.encode("utf-8")).hexdigest().strip()
-            filename = os.path.basename(path)
-            writetask = self.taskpool.query_upload_task(hashpath)
-            if writetask:
-                writetask.push_upload_file(data, offset)
-            else:
-                self.taskpool.upload_file(hashpath, self.api, path, filename, data, offset)
-            return len(data)
-        except Exception, e:
-            logger.error(e)
-            raise FuseOSError(ENOENT)
-        finally:
-            pass
+        hashpath = sha1(path.encode("utf-8")).hexdigest().strip()
+        filename = os.path.basename(path)
+        writetask = self.taskpool.query_upload_task(hashpath)
+        if writetask:
+            writetask.push_upload_file(data, offset)
+        else:
+            self.taskpool.upload_file(hashpath, self.api, path, filename, data, offset)
+        return len(data)
 
 
     def release(self, path, fh):
@@ -458,7 +460,6 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         downloadtask = self.taskpool.query_download_task(hashpath)
         if downloadtask:
             downloadtask.end_download_file()
-
         return 0
 
     def destroy(self, path):
@@ -484,5 +485,8 @@ if __name__ == "__main__":
     # fuse = FUSE(KuaiPanFuse(), argv[1], foreground=False, nothreads=False, debug=False)
     gid, uid = os.getgid(), os.getuid()
     opts = {"gid":gid, "uid":uid}
-    fuse = FUSE(KuaiPanFuse(), argv[1], foreground=False, nothreads=False, debug=False, gid=os.getgid(), uid=os.getuid(), allow_other=True, umask='0000')
+    fuse = FUSE(
+            KuaiPanFuse(), argv[1], foreground=True, nothreads=True, \
+            debug=True, gid=os.getgid(), uid=os.getuid(), allow_other=True, umask='0000'
+            )
 

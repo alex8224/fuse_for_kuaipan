@@ -15,7 +15,7 @@ import urllib
 import signal
 import common
 import requests
-import traceback
+from functools import wraps
 import lxml.html as html
 from config import Config
 
@@ -28,15 +28,19 @@ signal.signal(signal.SIGINT, handler)
 
 
 class OpenAPIError(Exception):
-    pass
+    def __init__(self, exception, traceobj):
+        super(OpenAPIError, self).__init__(exception, None, traceobj)
 
-class OpenAPIHTTPError(OpenAPIError):
-    def __init__(self, status, msg):
-        self.status = status
-        self.msg = msg
+def catchexception(func):
 
-    def __str__(self):
-        return "%s - %s" % (self.status, self.msg)
+    @wraps(func)
+    def catch(*args, **kwargs):
+        try:
+            return func(*args, **kwargs)
+        except:
+            _, exception, tracebackinfo  = sys.exc_info()
+            raise OpenAPIError(exception, tracebackinfo)
+    return catch    
 
 class KuaipanAPI(object):
     VERSION = "1.0"
@@ -55,6 +59,7 @@ class KuaipanAPI(object):
         auth_code = self.get_auth_code(authorize_url)
         self.access_token(auth_code)
 
+    @catchexception
     def request_token(self, callback=None):
         sig_req_url = self.__get_sig_url("request_token_base_url",has_oauth_token=False)
         rf = requests.get(sig_req_url)
@@ -66,11 +71,12 @@ class KuaipanAPI(object):
                     v = d.get(k)
                     setattr(self, common.to_string(k), common.safe_value(v))
         else:
-            raise OpenAPIHTTPError(status, rf.read())
+            raise OpenAPIError(status, rf.read())
 
     def authorize(self):
         return config.get_authorize_url() % self.oauth_token
 
+    @catchexception
     def get_auth_code(self, url):
 
         ua = "Mozilla/5.0 (X11; Linux i686) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.153 Safari/537.36"
@@ -114,6 +120,7 @@ class KuaipanAPI(object):
                 base_url = str(base_url % urlsuffix)
             return self._sig_request_url(base_url, parameters,method=httpmethod)
 
+    @catchexception
     def access_token(self, auth_code):
         parameters = self._oauth_parameter()
         parameters["oauth_verifier"] = auth_code
@@ -126,18 +133,21 @@ class KuaipanAPI(object):
         self.charged_dir = str(tokeninfo["charged_dir"])
         self.userid = tokeninfo["user_id"]
 
+    @catchexception
     def account_info(self):
         sig_req_url = self.__get_sig_url("account_info")
         req_accinfo = requests.get(sig_req_url)
         return req_accinfo.json()
 
+    @catchexception
     def metadata(self,root="app_folder", path=''):
         sig_req_url = self.__get_sig_url("metadata", urlsuffix=(root, urllib.quote(path.encode("utf-8"))))
         metadata_result = requests.get(sig_req_url)
         return metadata_result.json() if metadata_result.status_code==200 else metadata_result
 
 
-    def download_file(self, filepath):
+    @catchexception
+    def download_file(self, filepath, bufsize=0):
         attach = {"path":filepath, "root":"app_folder"}
         sig_req_url = self.__get_sig_url("download", attachdata=attach)
 
@@ -145,57 +155,72 @@ class KuaipanAPI(object):
             req_download = requests.get(sig_req_url,stream=True)
             fd = req_download.raw
             count = 0
-            bufsize = 8192
-            # pdf = open("/tmp/abc", "w")
+            bufsize = bufsize
+            isfirst=True
+            yield
             while 1:
-                buff = fd.read(bufsize)
-                if not buff:
-                    break
-                # pdf.write(buff)
-                bufsize = (yield buff)
+                if isfirst:
+                    buff = fd.read(bufsize)
+                    if not buff:
+                        break
+                    bufsize = (yield buff)
+                    isfirst= False
+                else:
+                    buff = fd.read(bufsize)
+                    if not buff:
+                        break
+                    bufsize = (yield buff)
                 count += len(buff)
         except Exception, e:
-            traceback.print_exc()
+            raise OpenAPIError(e)
 
 
+    @catchexception
     def create_folder(self, folder,dir=""):
         attach = {"root":"app_folder", "path":folder}
         sig_req_url = self.__get_sig_url("create_folder", attachdata=attach)
         return requests.get(sig_req_url)
 
+    @catchexception
     def upload(self, uploadpath, name):
+        try:
+            def get_upload_locate():
+                locate_url = self.__get_sig_url("upload_locate")
+                resp = requests.get(locate_url)
+                return resp, resp.json()
 
-        def get_upload_locate():
-            locate_url = self.__get_sig_url("upload_locate")
-            resp = requests.get(locate_url)
-            return resp, resp.json()
+            # import pdb;pdb.set_trace()
+            result, upload_url = get_upload_locate()
+            basename = os.path.basename(name)
+            upload_filename = uploadpath + "/" + basename
+            attach = {"overwrite":"True","root":"app_folder","path":upload_filename}
+            upload_url = self.__get_sig_url("upload",urlsuffix=(upload_url["url"],), attachdata=attach, httpmethod="post")
+            files = {'file': (urllib.quote(basename.encode("utf-8")), open(name, 'rb'))}
+            return requests.post(upload_url, files=files)
+        except:
+            _, exception, tracebackinfo  = sys.exc_info()
+            raise OpenAPIError(exception, tracebackinfo)
 
-        # import pdb;pdb.set_trace()
-        result, upload_url = get_upload_locate()
-        basename = os.path.basename(name)
-        upload_filename = uploadpath + "/" + basename
-        attach = {"overwrite":"True","root":"app_folder","path":upload_filename}
-        upload_url = self.__get_sig_url("upload",urlsuffix=(upload_url["url"],), attachdata=attach, httpmethod="post")
-        files = {'file': (urllib.quote(basename.encode("utf-8")), open(name, 'rb'))}
-        return requests.post(upload_url, files=files)
 
+    @catchexception
     def delete(self, filename):
         attach = {"root":"app_folder","path":filename}
         sig_req_url = self.__get_sig_url("delete", attachdata=attach)
         delete_result = requests.get(sig_req_url)
         return delete_result
 
+    @catchexception
     def copy(self, frompath, topath):
         attach = {"root":"app_folder", "from_path":frompath, "to_path":topath}
         sig_req_url = self.__get_sig_url("copy", attachdata=attach)
         copy_result = requests.get(sig_req_url)
         return copy_result.json() if copy_result.status_code == 200 else copy_result
 
+    @catchexception
     def move(self, frompath, topath):
         attach = {"root":"app_folder","from_path":frompath, "to_path":topath}
         sig_req_url = self.__get_sig_url("move", attachdata=attach)
         move_result = requests.get(sig_req_url)
-        # return move_result.json() if move_result.status_code == 200 else move_result
         return move_result
 
     def _oauth_parameter(self, has_token=True):
