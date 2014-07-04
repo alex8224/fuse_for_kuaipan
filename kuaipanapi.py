@@ -31,6 +31,8 @@ class OpenAPIError(Exception):
     def __init__(self, exception, traceobj):
         super(OpenAPIError, self).__init__(exception, None, traceobj)
 
+class OpenAPIException(Exception):pass
+
 def catchexception(func):
 
     @wraps(func)
@@ -140,11 +142,9 @@ class KuaipanAPI(object):
         return req_accinfo.json()
 
     @catchexception
-    def metadata(self,root="app_folder", path=''):
+    def metadata(self,root="app_folder", path=""):
         sig_req_url = self.__get_sig_url("metadata", urlsuffix=(root, urllib.quote(path.encode("utf-8"))))
-        metadata_result = requests.get(sig_req_url)
-        return metadata_result.json() if metadata_result.status_code==200 else metadata_result
-
+        return requests.get(sig_req_url)
 
     @catchexception
     def download_file(self, filepath, bufsize=0):

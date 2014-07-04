@@ -25,7 +25,7 @@ from functools import partial
 from kuaipanapi import KuaipanAPI
 from Queue import Queue, Empty
 from stat import S_IFDIR, S_IFREG
-from kuaipanapi import OpenAPIError
+from kuaipanapi import OpenAPIError, OpenAPIException
 from threading import Thread, Event,  RLock as Lock
 from errno import ENOENT,EROFS, ENOTEMPTY, EEXIST, EIO
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
@@ -34,14 +34,14 @@ from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 TYPE_DIR= (S_IFDIR | 0644 )
 TYPE_FILE= (S_IFREG | 0644 )
 
-CACHE_PATH = "/tmp/"
+CACHE_PATH = "/dev/shm/"
 
 ROOT_ST_INFO = {
         "st_mtime": common.timestamp(),
         "st_mode":  TYPE_DIR,
         "st_size":  4096,
-        "st_gid":   0,
-        "st_uid":   0,
+        "st_gid":   os.getgid(),
+        "st_uid":   os.getuid(),
         "st_atime": common.timestamp()
         }
 
@@ -65,17 +65,27 @@ def handler(signum, frame):
 
 signal.signal(signal.SIGINT, handler)
 
+def unique_id():
+    from hashlib import md5
+    from uuid import uuid1
+    return md5(str(uuid1())).hexdigest()
+
 class Future(object):
 
     def __init__(self, notify = None):
         self.result = None
         self.finished = False
         self.notify = notify
+        self.waitobj = Event()
 
     def get(self):
-        while not self.is_finished:
-            time.sleep(1)
-        self.notify(self.result)
+        while 1:
+            self.waitobj.wait()
+            if self.is_finished:
+                self.notify(self.result)
+                return self.result
+            else:
+                self.waitobj.clear()
 
     def is_finished(self):
         return self.finished
@@ -86,13 +96,16 @@ class TaskPool(object):
         self.uploadpool = {}
         self.downloadpool = {}
         self.uploadlock, self.downlock = Lock(), Lock()
-        self.taskclass = {"upload":WriteTask,"download":DownloadTask}
+        self.taskclass = {"upload":WriteTask,"download":DownloadTask, "fusetask":FuseTask}
 
     def upload_file(self, hashpath, *args):
         return self.__new_task("upload", hashpath, *args)
 
     def download_file(self, hashpath, *args):
         return self.__new_task("download", hashpath, *args)
+
+    def do_fuse_task(self, method, *args):
+        return self.__new_task("fusetask", unique_id(), method, *args)
 
     def __task_sucess(self, tasktype, key, result=None):
         lock = self.__getlock(tasktype)
@@ -132,6 +145,47 @@ class TaskPool(object):
             if pool.has_key(key):
                return pool[key]
 
+class FuseTask(Thread, Future):
+
+    def __init__(self, method, key, api, *args):
+        Thread.__init__(self)
+        Future.__init__(self)
+        self.method = method
+        self.api = api
+        self.args = args[:-1]
+        self.notify = args[-1:][0]
+
+    def readdir(self, path):
+        return self.api.metadata(path=path)
+
+    def mkdir(self, path):
+        return self.api.create_folder(path)
+
+    def rmdir(self, path):
+        return self.api.delete(path)
+
+    def unlink(self, path):
+        return self.rmdir(path)
+
+    def rename(self, oldpath, newpath):
+        return self.api.move(oldpath, newpath)
+
+    def run(self):
+        try:
+            method = getattr(self, self.method)
+            result = method(*self.args)
+            logger.debug(result.text)
+            if result.status_code == 200:
+                self.result = (True, result.json())
+            else:
+                self.result = FuseOSError(EIO)
+        except:
+            _, exc, trace = sys.exc_info()
+            print exc
+            self.result = FuseOSError(EIO)
+        finally:
+            self.waitobj.set()
+
 class DownloadTask(Future):
 
     def __init__(self, api, hashpath, path, bufsize, notify):
@@ -146,7 +200,7 @@ class DownloadTask(Future):
         self.downloadbytes = 0
         self.lock = Lock()
 
-    def wait_data(self,size=None):
+    def wait_data(self,size):
         '''等待达到指定的ｓｉｚｅ后返回给调用端'''
         self.waiter.wait()
         with self.lock:
@@ -163,16 +217,20 @@ class DownloadTask(Future):
                     return data
                 except StopIteration:
                     self.buffgen.close()
+                except:
+                    import pdb;pdb.set_trace()
+                    traceback.print_exc()
 
     def end_download_file(self):
         logger.debug("file %s download completed, %d bytes downloaded, key %s" % (self.path, self.downloadbytes, self.hashpath))
-        self.notify()
+        with self.lock:
+            self.notify()
 
     def start(self):
-        '''调用下载文件的ＡＰＩ，在数据可用时通知调用端开始下载数据'''
         logger.debug("start download %s" % self.path)
-        self.buffgen = self.api.download_file(self.path, self.bufsize)
-        self.waiter.set()
+        with self.lock:
+            self.buffgen = self.api.download_file(self.path, self.bufsize)
+            self.waiter.set()
 
 class WriteTask(Thread, Future):
     '''用来调用ＡＰＩ上传文件'''
@@ -207,7 +265,7 @@ class WriteTask(Thread, Future):
             f.seek(offset)
             f.write(data)
             self.writebytes += len(data)
-            logger.debug("written %d bytes" % self.writebytes)
+            #logger.debug("written %d bytes" % self.writebytes)
 
     def push_upload_file(self, data, offset):
         self.sendmesg(("push_upload_file", (data, offset)))
@@ -219,7 +277,7 @@ class WriteTask(Thread, Future):
                 f.seek(offset)
                 f.write(data)
                 self.writebytes += len(data)
-                logger.debug("written %d bytes" % self.writebytes)
+                #logger.debug("written %d bytes" % self.writebytes)
 
     def end_upload_file(self):
         self.sendmesg(("end_upload_file", ()))
@@ -255,7 +313,7 @@ class WriteTask(Thread, Future):
         methodname, args = mesg
         internalmethod = self.clsname + "__" + methodname
         if hasattr(self, internalmethod):
-            logger.debug("call method %s " % (methodname, ))
+            #logger.debug("call method %s " % (methodname, ))
             return getattr(self, internalmethod)(*args)
         else:
             logger.error("no such method %s, params: %s" % (methodname, args))
@@ -280,14 +338,18 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         self.fd = 0
         self.fileprops = {"/":ROOT_ST_INFO}
         self.taskpool = TaskPool()
-        self.rootfiles = self.listdir("/")
+        self.rootfiles = []
+        self.rlock = Lock()
 
     def __call__(self, op, *args):
         try:
             return super(KuaiPanFuse, self).__call__(op, *args)
+        except TypeError, te:
+            import pdb;pdb.set_trace()
+            import traceback;traceback.print_exc()
+            print "热不熟"
         except Exception ,e:
-            logger.error(traceback.format_exc())
-            if isinstance(e, OpenAPIError):
+            if isinstance(e, OpenAPIError) or isinstance(e, OpenAPIException):
                 raise FuseOSError(EIO)
             else:
                 raise
@@ -309,30 +371,39 @@ class KuaiPanFuse(LoggingMixIn, Operations):
              容易使用的结构
              {"path":st_info}
         '''
-        metadata_for_dir = self.api.metadata(path=path)
-        for finfo in metadata_for_dir["files"]:
-            path_as_key = path + finfo["name"] if path == "/" else path + "/" + finfo["name"]
-            st_info = {
-                        "st_mtime": common.to_timestamp(finfo["modify_time"]),
-                        "st_mode":  TYPE_FILE if finfo["type"] == "file" else TYPE_DIR,
-                        "st_size":  int(finfo["size"]),
-                        "st_gid":   0,
-                        "st_uid":   0,
-                        "st_atime": common.timestamp(),
-                        "type":     finfo["type"]
-                    }
-            self.fileprops[path_as_key] = st_info
+        with self.rlock:
+            task = self.taskpool.do_fuse_task("readdir", self.api, path)
+            _, metadata_for_dir = task.get()
+            try:
+                for finfo in metadata_for_dir["files"]:
+                    path_as_key = path + finfo["name"] if path == "/" else path + "/" + finfo["name"]
+                    st_info = {
+                                "st_mtime": common.to_timestamp(finfo["modify_time"]),
+                                "st_mode":  TYPE_FILE if finfo["type"] == "file" else TYPE_DIR,
+                                "st_size":  int(finfo["size"]) if finfo["type"] == "file" else 4096,
+                                "st_gid":   0,
+                                "st_uid":   0,
+                                "st_atime": common.timestamp(),
+                            }
+                    self.fileprops[path_as_key] = st_info
 
-        allfiles = ['.','..']
+                allfiles = ['.','..']
 
-        for remotefile in metadata_for_dir["files"]:
-            allfiles.append(remotefile["name"])
+                for remotefile in metadata_for_dir["files"]:
+                    allfiles.append(remotefile["name"])
 
-        self.rootfiles = allfiles
-        return allfiles
+                self.rootfiles = allfiles
+                return allfiles
+            except TypeError:
+                import pdb;pdb.set_trace()
+
+    # def opendir(self, path):
+        # self.listdir(path)
+        # return 0
 
     def readdir(self, path, fh):
-        return self.rootfiles
+        with self.rlock:
+            return self.rootfiles
 
     def getattr(self, path, fh=None):
         ''' 'st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid' '''
@@ -345,38 +416,28 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         hashpath = sha1(path.encode("utf-8")).hexdigest().strip()
         downloadtask = self.taskpool.query_download_task(hashpath)
         if downloadtask:
-            data = downloadtask.wait_data(size)
-            logger.debug("ReEnter wait_data for file %s , got %d bytes" % (hashpath,len(data)))
-            return data
+            logger.debug("ReEnter wait_data for file %s , require %d bytes" % (path,size))
+            return downloadtask.wait_data(size)
         else:
-            logger.debug("Create download task%s, require %d bytes" % (hashpath, size))
+            logger.debug("Create download task%s, file %s, require %d bytes" % (hashpath, path, size))
             downloadtask = self.taskpool.download_file(hashpath, self.api, path, size)
-            return downloadtask.wait_data()
+            return downloadtask.wait_data(size)
 
     def unlink(self, path):
-        result = self.api.delete(path)
-        if result.status_code == 200:
-            logger.debug("%s delete ok" % path)
-            if self.fileprops.has_key(path):
-                self.listdir(os.path.dirname(path))
-                del self.fileprops[path]
-            return 0
-        else:
-            logger.error("%s delete failed, reason is:%s" % (path,result.text))
-            raise FuseOSError(ENOENT)
+        self.taskpool.do_fuse_task("unlink", self.api, path)
+        self.__cleancache(path)
+        return 0
 
     def truncate(self, path, length, fh=None):
         if self.fileprops.has_key(path):
             raise FuseOSError(EEXIST)
 
     def rename(self, oldpath, newpath):
-        result = self.api.move(oldpath, newpath)
-        if result.status_code == 200:
+        with self.rlock:
+            self.taskpool.do_fuse_task("rename", self.api, oldpath, newpath)
             oldinfo = self.fileprops[oldpath]
             self.fileprops[newpath] = oldinfo
             del self.fileprops[oldpath]
-        else:
-            raise FuseOSError(EIO)
 
     def __isdir(self, path):
         return self.fileprops[path]["st_mode"] == TYPE_DIR
@@ -385,8 +446,7 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         return self.fileprops[path]["st_mode"] == TYPE_FILE
 
     def access(self, path, mode):
-
-        if self. __isdir(path):
+        if self.__isdir(path):
             self.listdir(path)
             return 0
 
@@ -405,36 +465,45 @@ class KuaiPanFuse(LoggingMixIn, Operations):
     def __getparentdir(self, path):
         return os.path.abspath(os.path.join(path, os.pardir))
 
-    def rmdir(self, path):
+    def __getcurrentdir(self, path):
+        return os.path.dirname(path)
 
-        if self.fileprops.has_key(path):
-            if len(
-                    filter(
-                        lambda dirname:dirname.startswith(path), self.fileprops.keys())
-                    ) > 1:
-               raise FuseOSError(ENOTEMPTY)
+    def __cleancache(self, path):
+        with self.rlock:
+            logger.debug("delete %s from cache" % path)
+            if self.fileprops.has_key(path):
+                del self.fileprops[path]
+
+            pure_file = "".join(path[1:])
+            if pure_file in self.rootfiles:
+                fileindex = self.rootfiles.index(pure_file)
+                del self.rootfiles[fileindex]
+
+    def __addcache(self, path, typecode):
+        logger.debug("add %s to cache" % path)
+        with self.rlock:
+            if typecode == TYPE_FILE:
+                fileinfo = copy.copy(ROOT_ST_INFO)
+                fileinfo["st_mode"] = TYPE_FILE
+                fileinfo["st_nlink"] = 1
+                self.fileprops[path] = fileinfo
             else:
-               del self.fileprops[path]
+                dirinfo = copy.copy(ROOT_ST_INFO)
+                self.fileprops[path] = dirinfo
 
-        result = self.api.delete(path)
-        if result.status_code == 200:
-            self.listdir(self.__getparentdir(path))
-            return 0
-        else:
-            raise FuseOSError(ENOENT)
+            self.rootfiles.append(path)
+        
+    def rmdir(self, path):
+        self.taskpool.do_fuse_task("rmdir", self.api, path)
+        self.__cleancache(path)
+        return 0
 
     def mkdir(self, path, mode):
-        result = self.api.create_folder(path)
-        if result.status_code == 200:
-            self.fileprops[path] = ROOT_ST_INFO
-        else:
-            logger.debug("mkdir %s failed" % path)
+        self.taskpool.do_fuse_task("mkdir", self.api, path)
+        self.__addcache(path, TYPE_DIR)
 
     def create(self, path, mode, fi=None):
-        fileinfo = copy.copy(ROOT_ST_INFO)
-        fileinfo["st_mode"] = (S_IFREG | mode)
-        fileinfo["st_nlink"] = 1
-        self.fileprops[path] = fileinfo
+        self.__addcache(path, TYPE_FILE)
         self.fd += 1
         return self.fd
 
@@ -486,7 +555,7 @@ if __name__ == "__main__":
     gid, uid = os.getgid(), os.getuid()
     opts = {"gid":gid, "uid":uid}
     fuse = FUSE(
-            KuaiPanFuse(), argv[1], foreground=True, nothreads=True, \
-            debug=True, gid=os.getgid(), uid=os.getuid(), allow_other=True, umask='0000'
+            KuaiPanFuse(), argv[1], foreground=True, nothreads=False, \
+            debug=False, kernel_cache=True, gid=os.getgid(), uid=os.getuid(), allow_other=True, umask='0000'
             )
 
