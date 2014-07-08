@@ -589,7 +589,7 @@ def main():
         exit(1)
 
     FUSE(
-            KuaiPanFuse(), argv[1], foreground=True, nothreads=False, 
+            KuaiPanFuse(), argv[1], foreground=False, nothreads=False, 
             debug=False, direct_io=False, gid=os.getgid(), uid=os.getuid(), 
             allow_other=True, umask='0133'
         )
