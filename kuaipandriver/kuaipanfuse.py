@@ -21,10 +21,8 @@ import signal
 import common
 import logging
 import traceback
-from sys import argv
 from hashlib import sha1
 from functools import partial
-from kuaipanapi import KuaipanAPI
 from Queue import Queue, Empty
 from stat import S_IFDIR, S_IFREG
 from kuaipanapi import OpenAPIError, OpenAPIException
@@ -44,7 +42,8 @@ ROOT_ST_INFO = {
         "st_size":  4096,
         "st_gid":   os.getgid(),
         "st_uid":   os.getuid(),
-        "st_atime": common.timestamp()
+        "st_atime": common.timestamp(),
+        "st_nlink": 2
         }
 
 def getLogger():
@@ -329,7 +328,6 @@ class WriteTask(Thread, Future):
         methodname, args = mesg
         internalmethod = self.clsname + "__" + methodname
         if hasattr(self, internalmethod):
-            #logger.debug("call method %s " % (methodname, ))
             return getattr(self, internalmethod)(*args)
         else:
             logger.error("no such method %s, params: %s" % (methodname, args))
@@ -348,8 +346,8 @@ class WriteTask(Thread, Future):
 
 class KuaiPanFuse(LoggingMixIn, Operations):
 
-    def __init__(self):
-        self.api = KuaipanAPI()
+    def __init__(self, api):
+        self.api = api
         self.root = "."
         self.fd = 0
         self.fileprops = {"/":ROOT_ST_INFO}
@@ -388,9 +386,7 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         with self.rlock:
             task = self.taskpool.do_fuse_task("readdir", self.api, path)
             success, result = task.get()
-            # try:
-            if not success:
-                raise result
+            if not success: raise result
             self.cwd = path
             for finfo in result["files"]:
                 path_as_key = path + finfo["name"] if path == "/" else path + "/" + finfo["name"]
@@ -398,8 +394,8 @@ class KuaiPanFuse(LoggingMixIn, Operations):
                             "st_mtime": common.to_timestamp(finfo["modify_time"]),
                             "st_mode":  TYPE_FILE if finfo["type"] == "file" else TYPE_DIR,
                             "st_size":  int(finfo["size"]) if finfo["type"] == "file" else 4096,
-                            "st_gid":   0,
-                            "st_uid":   0,
+                            "st_gid":   os.getgid(),
+                            "st_uid":   os.getuid(),
                             "st_atime": common.timestamp(),
                         }
                 self.fileprops[path_as_key] = st_info
@@ -407,13 +403,10 @@ class KuaiPanFuse(LoggingMixIn, Operations):
             allfiles = ['.','..']
 
             for remotefile in result["files"]:
-                #当前目录的所有文件名,包含目录名
                 allfiles.append(remotefile["name"])
 
             self.rootfiles = allfiles
             return allfiles
-        # except Exception ,e:
-                # logger.error(e)
 
     def chmod(self, path, mode):
         logger.debug("chmod %s" % path)
@@ -584,12 +577,27 @@ class KuaiPanFuse(LoggingMixIn, Operations):
 
 
 def main():
-    if len(argv) != 2:
-        print('usage: %s <mountpoint>' % os.path.basename(argv[0]))
-        exit(1)
+    from kuaipandriver.kuaipanapi import KuaipanAPI
+    from kuaipandriver.common import getauthinfo
+    from requests.exceptions import RequestException
+    while 1:
+        try:
+            mntpoint, key, secret, user, pwd = getauthinfo()
+            api = KuaipanAPI(mntpoint, key, secret, user, pwd)
+            break
+        except RequestException:
+            retry = raw_input("Your Login info already wrong, do you want to re enter it?(Y/N)")
+            if retry == "Y":
+                from kuaipandriver.common import deleteloginfo
+                deleteloginfo()
+            else:
+                break
 
-    FUSE(
-            KuaiPanFuse(), argv[1], foreground=True, nothreads=False, 
-            debug=False, direct_io=False, gid=os.getgid(), uid=os.getuid(), 
-            allow_other=True, umask='0133'
-        )
+    try:
+        FUSE(
+                KuaiPanFuse(api), mntpoint, foreground=False, nothreads=False, 
+                debug=False, direct_io=False, gid=os.getgid(), uid=os.getuid(), 
+                umask='0133'
+            )
+    except RuntimeError as err:
+        print str(err)

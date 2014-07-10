@@ -19,6 +19,7 @@ from functools import wraps
 import lxml.html as html
 from kuaipandriver.config import Config
 from kuaipandriver.common import oauth_once_next
+from requests.exceptions import RequestException
 
 next_oauth_once = oauth_once_next()
 
@@ -47,14 +48,16 @@ def catchexception(func):
     return catch    
 
 class KuaipanAPI(object):
+
     VERSION = "1.0"
     SIG_METHOD = "HMAC-SHA1"
 
-    def __init__(self):
-        self.consumer_key = config.get_consumer_key()
-        self.consumer_secret = config.get_consumer_secret()
-        self.auth_user = config.get_auth_user()
-        self.auth_pwd = config.get_auth_pwd()
+    def __init__(self, mntpoint, key, secret, user, pwd):
+        self.mntpoint = mntpoint
+        self.consumer_key = key
+        self.consumer_secret = secret
+        self.auth_user = user
+        self.auth_pwd = pwd
         self.login()
 
     def login(self):
@@ -62,41 +65,55 @@ class KuaipanAPI(object):
         authorize_url = self.authorize()
         auth_code = self.get_auth_code(authorize_url)
         self.access_token(auth_code)
+        from kuaipandriver.common import savelogin
+        savelogin(self.mntpoint, self.consumer_key, self.consumer_secret, self.auth_user, self.auth_pwd)
 
-    @catchexception
     def request_token(self, callback=None):
         sig_req_url = self.__get_sig_url("request_token_base_url",has_oauth_token=False)
-        rf = requests.get(sig_req_url)
-        status = rf.status_code
-        if status == 200:
-            d = rf.json()
-            for k in (u'oauth_token', u'oauth_token_secret', u'oauth_callback_confirmed'):
-                if d.has_key(k):
-                    v = d.get(k)
-                    setattr(self, common.to_string(k), common.safe_value(v))
-        else:
-            print(rf.text)
-            raise OpenAPIError(status, rf.read())
+        try:
+            result = requests.get(sig_req_url)
+            msg = ''
+            if result.status_code == 200:
+                msg = result.json()
+                for k in (u'oauth_token', u'oauth_token_secret', u'oauth_callback_confirmed'):
+                    if msg.has_key(k):
+                        v = msg.get(k)
+                        setattr(self, common.to_string(k), common.safe_value(v))
+            elif result.status_code == 500:
+                raise RequestException("kuaipan internal server error!")
+            else:
+                raise RequestException(result.json()["msg"])
+        except RequestException as reqex:
+            errmsg = "get init token failed!, err message is:%s" % str(reqex)
+            print(errmsg)
+            sys.exit(1)
+            
 
     def authorize(self):
         return config.get_authorize_url() % self.oauth_token
 
-    @catchexception
     def get_auth_code(self, url):
+        try:
+            ua = "Mozilla/5.0 (X11; Linux i686) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.153 Safari/537.36"
+            sess = requests.Session()
+            referer = url
+            step1_request = sess.get(url)
+            htdoc = html.fromstring(step1_request.text)
+            s, app_name, oauth_token = htdoc.xpath("//input[@type='hidden']")
+            post_payload = {"username":self.auth_user, "userpwd":self.auth_pwd,"s":s.value, "app_name":app_name.value, "oauth_token":oauth_token.value}
+            headers = {"User-Agent":ua,"Referer":referer, "Host":"www.kuaipan.cn"}
+            posturl = "https://www.kuaipan.cn/api.php?ac=open&op=authorisecheck"
 
-        ua = "Mozilla/5.0 (X11; Linux i686) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.153 Safari/537.36"
-        sess = requests.Session()
-        referer = url
-        step1_request = sess.get(url)
-        htdoc = html.fromstring(step1_request.text)
-        s, app_name, oauth_token = htdoc.xpath("//input[@type='hidden']")
-        post_payload = {"username":self.auth_user, "userpwd":self.auth_pwd,"s":s.value, "app_name":app_name.value, "oauth_token":oauth_token.value}
-        headers = {"User-Agent":ua,"Referer":referer, "Host":"www.kuaipan.cn"}
-        posturl = "https://www.kuaipan.cn/api.php?ac=open&op=authorisecheck"
-
-        step2_request = sess.post(posturl, data=post_payload,headers=headers)
-        htdoc = html.fromstring(step2_request.text)
-        return htdoc.xpath("//strong")[0].text
+            step2_request = sess.post(posturl, data=post_payload,headers=headers)
+            htdoc = html.fromstring(step2_request.text)
+            msg = htdoc.xpath("//strong")[0].text
+            if not msg.isdigit():
+                raise RequestException(msg.encode("utf-8"))
+            return msg
+        except RequestException as reqex:
+            errmsg = "get auth code failed!, error message is:%s" % str(reqex)
+            print(errmsg)
+            raise
 
     def __get_sig_url(self, method, urlsuffix=None, attachdata=None, httpmethod="get",has_oauth_token=True):
         method_url = {
@@ -125,18 +142,26 @@ class KuaipanAPI(object):
                 base_url = str(base_url % urlsuffix)
             return self._sig_request_url(base_url, parameters,method=httpmethod)
 
-    @catchexception
     def access_token(self, auth_code):
-        parameters = self._oauth_parameter()
-        parameters["oauth_verifier"] = auth_code
-        base_url = config.get_access_token_base_url()
-        sig_req_url = self._sig_request_url(base_url, parameters)
-        req_accesstoken = requests.get(sig_req_url)
-        tokeninfo = req_accesstoken.json()
-        self.oauth_token = str(tokeninfo["oauth_token"])
-        self.oauth_token_secret = str(tokeninfo["oauth_token_secret"])
-        self.charged_dir = str(tokeninfo["charged_dir"])
-        self.userid = tokeninfo["user_id"]
+        try:
+            parameters = self._oauth_parameter()
+            parameters["oauth_verifier"] = auth_code
+            base_url = config.get_access_token_base_url()
+            sig_req_url = self._sig_request_url(base_url, parameters)
+            req_accesstoken = requests.get(sig_req_url)
+
+            if req_accesstoken.status_code != 200:
+                raise RequestException(req_accesstoken.json()["msg"])
+
+            tokeninfo = req_accesstoken.json()
+            self.oauth_token = str(tokeninfo["oauth_token"])
+            self.oauth_token_secret = str(tokeninfo["oauth_token_secret"])
+            self.charged_dir = str(tokeninfo["charged_dir"])
+            self.userid = tokeninfo["user_id"]
+        except RequestException as reqex:
+            errmsg = "get access token failed!, err message is:%s" % str(reqex)
+            print(errmsg)
+            sys.exit(1)
 
     @catchexception
     def account_info(self):
@@ -248,3 +273,25 @@ class KuaipanAPI(object):
         has_token = True if p.has_key('oauth_token') else False
         oauth_signature = common.generate_signature(base, p, self._secret_key(has_token=has_token), method)
         return common.get_request_url(base, p, oauth_signature)
+
+
+def test_api_limit():
+    k,s,u,p = "xchAnjnCdbjAmDVG", "xIb1iRVWEusFasLk", "alex8224@126.com","xtgdmjq"
+    api = KuaipanAPI("mnt", k,s,u,p)
+    import sys
+    stdout = sys.stdout
+    for x in range(100000):
+        try:
+            result = api.metadata(path="/")
+            if result.status_code != 200:
+                print result.text
+                break
+            else:
+                print result.json()
+            stdout.write("api call count: %d\r" % (x+1))
+            stdout.flush()
+        except:
+            break
+
+    print "api limit is: %d" % x
+

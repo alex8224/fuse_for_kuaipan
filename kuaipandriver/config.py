@@ -10,10 +10,9 @@
 import common
 import traceback
 from ConfigParser import ConfigParser
-
+from pkg_resources import resource_filename
 defaultNode = 'DEFAULT'
-
-configName = 'config.ini'
+configName = resource_filename("kuaipandriver", "config.ini")
 
 class _Method:
     def __init__(self, configobj, name):

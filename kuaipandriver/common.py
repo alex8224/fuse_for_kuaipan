@@ -6,6 +6,9 @@
 # Filename: common.py
 # Description:
 #****************************************************
+
+import os
+from os.path import expanduser
 import hmac
 import time
 import base64
@@ -92,3 +95,45 @@ def safe_value(v):
         return v.encode('utf-8')
     else:
         return v
+
+def getauthinfo():
+    from kuaipandriver.common import getloginfromlocal
+    loginfo = getloginfromlocal()
+    if loginfo:
+        return loginfo
+
+    mntpoint = raw_input("MountPoint:")
+    key = raw_input("ConsumerKey:")
+    secret = raw_input("ConsumerSecret:")
+    username = raw_input("Kuaipan Login Name:")
+    from getpass import getpass
+    pwd = getpass("Kuaipan Password:")
+    return mntpoint, key, secret, username, pwd
+
+def getloginfromlocal():
+    infofilepath= os.path.expanduser("~") + "/.kuaipandriver"
+    if os.path.exists(infofilepath):
+        import pickle
+        return pickle.load(file(infofilepath))
+
+def savelogin(mntpoint, key, secret, username, pwd):
+    import os
+    infofilepath = expanduser("~") + "/.kuaipandriver"
+    if os.path.exists(infofilepath):
+        return
+    save = raw_input("Do you want save your login info?(Y/N)")
+    if save == "Y":
+        infofilepath = os.path.expanduser("~")+ "/.kuaipandriver"
+        with open(infofilepath, "w") as infofile:
+            info = (mntpoint, key, secret, username, pwd )
+            import pickle
+            pickle.dump(info, infofile)
+            print("your login info saved in path %s" % infofilepath)
+
+
+def deleteloginfo():
+    infofilepath = expanduser("~")+ "/.kuaipandriver"
+    try:
+        os.unlink(infofilepath)
+    except:
+        pass

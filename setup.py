@@ -16,12 +16,15 @@ setup(
     url='https://github.com/alex8224/fuse_for_kuaipan',
     packages=['kuaipandriver'],
     package_data={
-        'shadowsocks': ['README.rst', 'LICENSE', 'config.ini']
+        'kuaipandriver': ['README.rst', 'LICENSE', 'config.ini']
     },
-    install_requires=[],
+    install_requires=[
+        "requests>=2.3.0", "fusepy>=2.0.2","lxml>=3.3.5"]
+    ,
     entry_points="""
     [console_scripts]
     mount.kuaipan = kuaipandriver.kuaipanfuse:main
+    test.apidaylimit = kuaipandriver.kuaipanapi:test_api_limit
     """,
     classifiers=[
         'License :: OSI Approved :: MIT License',
