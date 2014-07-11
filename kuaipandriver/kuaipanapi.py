@@ -127,7 +127,8 @@ class KuaipanAPI(object):
                         "move":config.get_fileops_move_base_url(),
                         "copy":config.get_fileops_copy_base_url(),
                         "upload_locate":config.get_fileops_upload_locate_base_url(),
-                        "upload":config.get_fileops_upload_suffix()
+                        "upload":config.get_fileops_upload_suffix(),
+                        "convert":config.get_fileops_convert_url()
                      }
 
         parameters = self._oauth_parameter(has_token=has_oauth_token)
@@ -166,8 +167,7 @@ class KuaipanAPI(object):
     @catchexception
     def account_info(self):
         sig_req_url = self.__get_sig_url("account_info")
-        req_accinfo = requests.get(sig_req_url)
-        return req_accinfo.json()
+        return requests.get(sig_req_url)
 
     @catchexception
     def metadata(self,root="app_folder", path=""):
@@ -251,6 +251,15 @@ class KuaipanAPI(object):
         move_result = requests.get(sig_req_url)
         return move_result
 
+    @catchexception
+    def convert(self, path, viewtype):
+        doctype = path[-3:]
+        print doctype
+        attach = {"type":doctype, "view":viewtype, "root":"app_folder", "path":path, "zip":1}
+        sig_req_url = self.__get_sig_url("convert", attachdata=attach)
+        return requests.get(sig_req_url, stream=True)
+
+
     def _oauth_parameter(self, has_token=True):
         parameters = {
                 'oauth_consumer_key': self.consumer_key,
@@ -276,7 +285,7 @@ class KuaipanAPI(object):
 
 
 def test_api_limit():
-    k,s,u,p = "xchAnjnCdbjAmDVG", "xIb1iRVWEusFasLk", "alex8224@126.com","xtgdmjq"
+    k,s,u,p = "", "", "",""
     api = KuaipanAPI("mnt", k,s,u,p)
     import sys
     stdout = sys.stdout
@@ -295,3 +304,22 @@ def test_api_limit():
 
     print "api limit is: %d" % x
 
+def test_doc_convert():
+    mnt, key, secret, user, pwd = "mnt", "xcQwIBu8a3fuGVK6", "WqoNwPRBXlirOiDA", "alex8224@163.com", "14yhl9t"
+    api = KuaipanAPI(mnt, key, secret, user, pwd)
+    path, viewtype = sys.argv[1], sys.argv[2]
+    result = api.convert(path,viewtype)
+    if result.status_code == 200:
+        # with open("index.html", "w") as doc:
+        fd = result.raw
+        zipfile = open(path +".zip", "w")
+        while 1:
+            data = fd.read(8182)
+            if data:
+                zipfile.write(data)
+            else:
+                break
+        print "convert ok"    
+    else:
+        print "convert failed!"
+        print result.text

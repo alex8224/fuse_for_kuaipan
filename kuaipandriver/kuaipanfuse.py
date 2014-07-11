@@ -33,6 +33,7 @@ from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 
 TYPE_DIR= (S_IFDIR | 0644 )
 TYPE_FILE= (S_IFREG | 0644 )
+BLOCK_SIZE = 4096
 
 CACHE_PATH = "/dev/shm/"
 
@@ -55,7 +56,7 @@ def getLogger():
     logger.addHandler(fdlr)
     hdlr.setFormatter(fm)
     fdlr.setFormatter(fm)
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(logging.WARN)
     return logger
 
 logger = getLogger()
@@ -111,14 +112,22 @@ class TaskPool(object):
     def download_file(self, hashpath, *args):
         return self.__new_task("download", hashpath, *args)
 
-    def do_fuse_task(self, method, *args):
-        return self.__new_task("fusetask", unique_id(), method, *args)
+    def do_fuse_task(self, method, *args, **kwargs):
+        return self.__new_task("fusetask", unique_id(), method, *args, **kwargs)
 
-    def __task_sucess(self, tasktype, key, result=None):
+    def do_delay_task(self, callableobj):
+        '''执行周期性的任务, 执行完就会从队列中删除, 在任务执行之前，调用者可以选择终止该任务，　任务可以被重新加入队列'''
+        pass
+
+    def __task_sucess(self, tasktype, key, result=None, callback=None):
         lock = self.__getlock(tasktype)
         with lock:
             logger.debug("task %s already complted!, delete it!" % key)
             pool = self.__getpool(tasktype)
+            if callback:
+                logger.debug("call callback method, the result is:%s" % str(result))
+                callback(result)
+
             if pool.has_key(key):
                 del pool[key]
 
@@ -128,8 +137,11 @@ class TaskPool(object):
     def __getpool(self, tasktype):
         return self.uploadpool if tasktype == "upload" else self.downloadpool
 
-    def __new_task(self, tasktype, key, *args):
-        callback_wrapper = partial(self.__task_sucess, tasktype, key)
+    def __new_task(self, tasktype, key, *args, **kwargs):
+        if kwargs and "callback" in kwargs:
+            callback_wrapper = partial(self.__task_sucess, tasktype, key, callback=kwargs["callback"])
+        else:
+            callback_wrapper = partial(self.__task_sucess, tasktype, key)
         taskparams = list(args)
         taskparams.insert(1, key)
         taskparams.extend([callback_wrapper])
@@ -151,6 +163,44 @@ class TaskPool(object):
             pool = self.__getpool(tasktype)
             if pool.has_key(key):
                return pool[key]
+
+class PeriodicTask(Thread, Future):
+
+    def __init__(self):
+        self.lock = Lock()
+        self.id2task= {}
+
+    def delay(self, callableobj, timeout):
+
+        with self.lock:
+            taskid = unique_id()
+            task = (time.time(), callableobj, timeout)
+            self.id2task[taskid] = task
+            return taskid
+
+    def cancel(self, taskid):
+        with self.lock:
+            if taskid in self.id2task:
+                self.task2id.pop(taskid)
+                logger.debug("task %s already canceled!")
+
+    def run(self):
+
+        cleanedtask = []
+        while 1:
+            with self.lock:
+                for taskid, task in self.id2task.iteritems():
+                    addtime, callableobj, timeout = task
+                    if (time.time() - addtime) > timeout:
+                        logger.debug("execute task %s")
+                        callableobj()
+                        cleanedtask.append(taskid)
+
+                for taskid in cleanedtask:
+                    del self.id2task[taskid]
+                cleanedtask = []
+
+            time.sleep(0.01)
 
 class FuseTask(Thread, Future):
 
@@ -178,6 +228,9 @@ class FuseTask(Thread, Future):
     def rename(self, oldpath, newpath):
         return self.api.move(oldpath, newpath)
 
+    def accountinfo(self):
+        return self.api.account_info()
+
     def run(self):
         try:
             method = getattr(self, self.method)
@@ -187,7 +240,8 @@ class FuseTask(Thread, Future):
                 self.set_result((True, result.json()))
             else:
                 self.set_result((False,FuseOSError(EIO)))
-        except:
+            self.notify(self.result) 
+        except Exception ,e:
             _, exc, trace = sys.exc_info()
             logger.error(exc)
             self.set_result = FuseOSError(EIO)
@@ -239,7 +293,6 @@ class DownloadTask(Thread, Future):
             self.waiter.set()
 
 class WriteTask(Thread, Future):
-    '''用来调用ＡＰＩ上传文件'''
 
     def __init__(self, api, hashpath, path, filename, data, offset, notify):
         Thread.__init__(self)
@@ -258,12 +311,10 @@ class WriteTask(Thread, Future):
     def sendmesg(self, cmd):
         self.cmd.put(cmd)
 
-
     def start_upload_file(self, data, offset):
         self.sendmesg(("start_upload_file", (data, offset)))
 
     def __start_upload_file(self, data, offset):
-        '''启动缓存文件的写入'''
         if os.path.exists(self.fullpath):
             os.unlink(self.fullpath)
 
@@ -276,7 +327,6 @@ class WriteTask(Thread, Future):
         self.sendmesg(("push_upload_file", (data, offset)))
 
     def __push_upload_file(self, data, offset):
-        '''将数据添加到对应的缓存文件中'''
         if os.path.exists(self.fullpath):
             with open(self.fullpath, "a") as f:
                 f.seek(offset)
@@ -287,8 +337,6 @@ class WriteTask(Thread, Future):
         self.sendmesg(("end_upload_file", ()))
 
     def __end_upload_file(self):
-        '''开始真正的上传文件'''
-
         def upload_file():
             try:
                 logger.debug("start upload file %s to kuaipan server" % self.path)
@@ -355,6 +403,8 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         self.rootfiles = []
         self.cwd = ''
         self.rlock = Lock()
+        self.setaccountinfo()
+        self.quota = {"f_blocks":0, "f_bavail":0}
 
     def __call__(self, op, *args):
         try:
@@ -364,6 +414,20 @@ class KuaiPanFuse(LoggingMixIn, Operations):
                 raise FuseOSError(EIO)
             else:
                 raise
+
+    def setaccountinfo(self):
+
+        def updatediskquota(result):
+            _, quota = result
+            totalspace, usedspace = quota["quota_total"], quota["quota_used"]
+            f_blocks = totalspace / BLOCK_SIZE
+            availspace = totalspace - usedspace
+            f_bavail = availspace / BLOCK_SIZE
+            self.quota["f_blocks"] = int(f_blocks)
+            self.quota["f_bavail"] = int(f_bavail)
+            logger.debug("totalspace=%d, usedspace=%d" % (totalspace, usedspace))
+
+        self.taskpool.do_fuse_task("accountinfo", self.api, callback=updatediskquota)
 
 
     def listdir(self, path="/testupload2"):
@@ -571,6 +635,16 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         if downloadtask:
             downloadtask.end_download_file()
         return 0
+
+    def statfs(self, path):
+        return dict(
+                    f_bsize=BLOCK_SIZE, 
+                    f_frsize=BLOCK_SIZE, 
+                    f_blocks=self.quota["f_blocks"], 
+                    f_bfree=self.quota["f_bavail"], 
+                    f_bavail=self.quota["f_blocks"]
+                    )
+        
 
     def destroy(self, path):
         pass
