@@ -305,7 +305,7 @@ def test_api_limit():
     print "api limit is: %d" % x
 
 def test_doc_convert():
-    mnt, key, secret, user, pwd = "mnt", "xcQwIBu8a3fuGVK6", "WqoNwPRBXlirOiDA", "alex8224@163.com", "14yhl9t"
+    mnt, key, secret, user, pwd = "mnt", "xcQwIBu8a3fuGVK6", "WqoNwPRBXlirOiDA", "", ""
     api = KuaipanAPI(mnt, key, secret, user, pwd)
     path, viewtype = sys.argv[1], sys.argv[2]
     result = api.convert(path,viewtype)
