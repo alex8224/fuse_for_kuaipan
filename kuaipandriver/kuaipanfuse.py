@@ -56,7 +56,7 @@ def getLogger():
     logger.addHandler(fdlr)
     hdlr.setFormatter(fm)
     fdlr.setFormatter(fm)
-    logger.setLevel(logging.WARN)
+    logger.setLevel(logging.DEBUG)
     return logger
 
 logger = getLogger()
@@ -105,6 +105,7 @@ class TaskPool(object):
         self.downloadpool = {}
         self.uploadlock, self.downlock = Lock(), Lock()
         self.taskclass = {"upload":WriteTask,"download":DownloadTask, "fusetask":FuseTask}
+        self.peroidictask = None
 
     def upload_file(self, hashpath, *args):
         return self.__new_task("upload", hashpath, *args)
@@ -115,9 +116,14 @@ class TaskPool(object):
     def do_fuse_task(self, method, *args, **kwargs):
         return self.__new_task("fusetask", unique_id(), method, *args, **kwargs)
 
-    def do_delay_task(self, callableobj):
+    def do_delay_task(self, callableobj, timeout):
         '''执行周期性的任务, 执行完就会从队列中删除, 在任务执行之前，调用者可以选择终止该任务，　任务可以被重新加入队列'''
-        pass
+        if self.peroidictask:
+            return  self.peroidictask.delay(callableobj, timeout)
+        else:
+            self.peroidictask = PeriodicTask()
+            self.peroidictask.start()
+            return self.peroidictask.delay(callableobj, timeout)
 
     def __task_sucess(self, tasktype, key, result=None, callback=None):
         lock = self.__getlock(tasktype)
@@ -164,14 +170,19 @@ class TaskPool(object):
             if pool.has_key(key):
                return pool[key]
 
-class PeriodicTask(Thread, Future):
+class PeriodicTask(Thread):
 
     def __init__(self):
+        Thread.__init__(self)
+        # Future.__init__(self)
+        self.setDaemon(True)
         self.lock = Lock()
         self.id2task= {}
 
     def delay(self, callableobj, timeout):
-
+        if not callable(callableobj):
+            raise TypeError("not callable object")
+            
         with self.lock:
             taskid = unique_id()
             task = (time.time(), callableobj, timeout)
@@ -192,7 +203,7 @@ class PeriodicTask(Thread, Future):
                 for taskid, task in self.id2task.iteritems():
                     addtime, callableobj, timeout = task
                     if (time.time() - addtime) > timeout:
-                        logger.debug("execute task %s")
+                        logger.debug("execute task %s" % callableobj)
                         callableobj()
                         cleanedtask.append(taskid)
 
@@ -200,7 +211,8 @@ class PeriodicTask(Thread, Future):
                     del self.id2task[taskid]
                 cleanedtask = []
 
-            time.sleep(0.01)
+            logger.debug("execute peroidicTask ...")
+            time.sleep(1)
 
 class FuseTask(Thread, Future):
 
@@ -403,7 +415,6 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         self.rootfiles = []
         self.cwd = ''
         self.rlock = Lock()
-        self.setaccountinfo()
         self.quota = {"f_blocks":0, "f_bavail":0}
 
     def __call__(self, op, *args):
@@ -427,10 +438,15 @@ class KuaiPanFuse(LoggingMixIn, Operations):
             self.quota["f_bavail"] = int(f_bavail)
             logger.debug("totalspace=%d, usedspace=%d" % (totalspace, usedspace))
 
-        self.taskpool.do_fuse_task("accountinfo", self.api, callback=updatediskquota)
+        #self.taskpool.do_fuse_task("accountinfo", self.api, callback=updatediskquota)
+        task = self.taskpool.do_fuse_task("accountinfo", self.api)
+        result = task.get()
+        logger.debug(result)
+        updatediskquota(result)
 
 
-    def listdir(self, path="/testupload2"):
+
+    def listdir(self, path=None):
         '''
         [{u'create_time': u'2014-06-26 14:50:00',
              u'file_id': u'7774526460920101',
@@ -448,6 +464,7 @@ class KuaiPanFuse(LoggingMixIn, Operations):
              {"path":st_info}
         '''
         with self.rlock:
+            self.taskpool.do_delay_task(self.setaccountinfo, 30)
             task = self.taskpool.do_fuse_task("readdir", self.api, path)
             success, result = task.get()
             if not success: raise result
@@ -637,6 +654,8 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         return 0
 
     def statfs(self, path):
+        logger.debug("statvfs %s" % path)
+        logger.debug(self.quota)
         return dict(
                     f_bsize=BLOCK_SIZE, 
                     f_frsize=BLOCK_SIZE, 
