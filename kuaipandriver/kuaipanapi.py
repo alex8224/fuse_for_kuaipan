@@ -9,7 +9,6 @@
 #****************************************************
 
 
-import os
 import sys
 import urllib
 import signal
@@ -24,6 +23,7 @@ from requests.exceptions import RequestException
 next_oauth_once = oauth_once_next()
 
 config = Config()
+# logger = getLogger()
 
 def handler(signum, frame):
     print "use press ctrl+c exit"
@@ -209,22 +209,44 @@ class KuaipanAPI(object):
         sig_req_url = self.__get_sig_url("create_folder", attachdata=attach)
         return requests.get(sig_req_url)
 
-    @catchexception
-    def upload(self, uploadpath, name, filename):
-        try:
-            def get_upload_locate():
-                locate_url = self.__get_sig_url("upload_locate")
-                resp = requests.get(locate_url)
-                return resp, resp.json()
+    def get_upload_locate(self, ):
+        locate_url = self.__get_sig_url("upload_locate")
+        resp = requests.get(locate_url)
+        return resp, resp.json()
 
-            # import pdb;pdb.set_trace()
-            result, upload_url = get_upload_locate()
-            basename = os.path.basename(name)
-            upload_filename = uploadpath + "/" + filename
-            attach = {"overwrite":"True","root":"app_folder","path":upload_filename}
-            upload_url = self.__get_sig_url("upload",urlsuffix=(upload_url["url"],), attachdata=attach, httpmethod="post")
-            files = {'file': (urllib.quote(filename.encode("utf-8")), open(name, 'rb'))}
-            return requests.post(upload_url, files=files)
+
+    @catchexception
+    def upload(self, uploadpath, fullpath, filename):
+        result, upload_url = self.get_upload_locate()
+        upload_filename = uploadpath + "/" + filename
+        attach = {"overwrite":"True","root":"app_folder","path":upload_filename}
+        upload_url = self.__get_sig_url("upload",urlsuffix=(upload_url["url"],), attachdata=attach, httpmethod="post")
+ 
+        try:
+            return self.curl_upload(upload_url, fullpath, filename)
+        except:
+            return self.default_upload(upload_url, fullpath, filename)
+
+
+    def curl_upload(self, upload_url, fullpath, filename):
+        import subprocess
+        from subprocess import PIPE
+        cmd = '''curl -D /dev/stdout -F "filedata=@%s" "%s"''' % (fullpath, upload_url)
+        print cmd
+        p = subprocess.Popen(cmd, stdout=PIPE,stderr=PIPE, shell=True)
+        upload_result = p.wait()
+        print("using curl to upload file %s with filename %s" % (fullpath, filename))
+        errormsg = p.stdout.read() + "\r\n" + p.stderr.read()
+        print(errormsg)
+        if upload_result == 0:
+            return True
+        else:
+            return False
+
+    def default_upload(self, upload_url, fullpath, filename):
+        try:
+            files = {'file': (urllib.quote(filename.encode("utf-8")), open(fullpath, 'rb'))}
+            return requests.post(upload_url, files=files).status_code == 200
         except:
             _, exception, tracebackinfo  = sys.exc_info()
             raise OpenAPIError(exception, tracebackinfo)
@@ -305,12 +327,11 @@ def test_api_limit():
     print "api limit is: %d" % x
 
 def test_doc_convert():
-    mnt, key, secret, user, pwd = "mnt", "xcQwIBu8a3fuGVK6", "WqoNwPRBXlirOiDA", "", ""
+    mnt, key, secret, user, pwd = "mnt", "", "", "", ""
     api = KuaipanAPI(mnt, key, secret, user, pwd)
     path, viewtype = sys.argv[1], sys.argv[2]
     result = api.convert(path,viewtype)
     if result.status_code == 200:
-        # with open("index.html", "w") as doc:
         fd = result.raw
         zipfile = open(path +".zip", "w")
         while 1:

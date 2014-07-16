@@ -28,16 +28,14 @@ def AtomCounter():
     return incrcounter
 
 def oauth_once_next():
-    # from threading import RLock
-    # lock = RLock()
     _counter = AtomCounter()
     _result = _counter()
     def getnext():
-        # with lock:
         count = _result.next()
         return count
 
     return getnext
+
 
 def __setlogger(logfile):
     logger = logging.getLogger()
@@ -48,8 +46,8 @@ def __setlogger(logfile):
     logger.setLevel(logging.NOTSET)
     return logger
 
-def logger():
-    return __setlogger(__api_log)
+# def logger():
+    # return __setlogger(__api_log)
 
 
 def to_timestamp(timestr):
