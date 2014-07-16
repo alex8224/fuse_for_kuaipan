@@ -813,38 +813,3 @@ def main():
             )
     except RuntimeError as err:
         print str(err)
-
-
-if __name__ == '__main__':
-
-    taskpool = ThreadPool(20, 10, 10)
-    import socket
-    socket.setdefaulttimeout(5)
-   
-    class Task(object):
-
-        def __init__(self, url, nfile):
-            self.url = url
-            self.nfile = nfile
-
-        def __call__(self, *args):
-            import urllib
-            try:
-                print("start downloading %s" % url)
-                data = urllib.urlopen(self.url).read()
-
-                fullpath = "/tmp/%d.PHP" % self.nfile
-                with open(fullpath, "w") as f:
-                    f.write(data)
-            except:
-                print("request url %s error" % url)
-            finally:
-                f.close()
-
-
-    urls = ["http://www.shenchuang.com/" for url in range(200)]   
-    print urls
-    for index in range(len(urls)):
-        taskpool.submit(Task(urls[index], index+1))
-
-    taskpool.quit()
