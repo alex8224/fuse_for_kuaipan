@@ -377,49 +377,6 @@ class FuseTask(Future):
     def accountinfo(self):
         return self.api.account_info()
  
-# class FuseTask(Thread, Future):
-
-    # def __init__(self, method, key, api, *args):
-        # Thread.__init__(self)
-        # Future.__init__(self)
-        # self.method = method
-        # self.api = api
-        # self.args = args[:-1]
-        # self.notify = args[-1:][0]
-
-
-    # def readdir(self, path):
-        # return self.api.metadata(path=path)
-
-    # def mkdir(self, path):
-        # return self.api.create_folder(path)
-
-    # def rmdir(self, path):
-        # return self.api.delete(path)
-
-    # def unlink(self, path):
-        # return self.rmdir(path)
-
-    # def rename(self, oldpath, newpath):
-        # return self.api.move(oldpath, newpath)
-
-    # def accountinfo(self):
-        # return self.api.account_info()
-    # 
-    # def run(self):
-        # try:
-            # method = getattr(self, self.method)
-            # result = method(*self.args)
-            # logger.debug(self.method + " - " + result.text)
-            # if result.status_code == 200:
-                # self.set_result((True, result.json()))
-            # else:
-                # self.set_result((False,FuseOSError(EIO)))
-            # self.notify(self.result) 
-        # except Exception ,e:
-            # _, exc, trace = sys.exc_info()
-            # logger.error(exc)
-            # self.set_result = FuseOSError(EIO)
 
 class DownloadTask(Thread, Future):
 
