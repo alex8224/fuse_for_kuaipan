@@ -8,9 +8,12 @@
 #Filename: kuanpanfuse.py
 #Description: 实现快盘的ＡＰＩ,可以实现文件的异步上传, 下载，浏览，目录操作
 # 缩略图和版本功能未实现
-#todo
-#1.download
-#2. retry after failed
+# todo
+# 1. bulid entire director tree
+# from root get file list. 判断如果是目录，则继续调用ＡＰＩ，轮询该目录,如果该目录下没有其他目录，则返回上一级
+# 使用stack代替递归，how?
+# 2. make wrietask and download task managmented by threadpool
+# 3. add virtualdirectory support extend task, for example: document convert
 #********************************************************************************
 import os
 import sys
@@ -29,9 +32,8 @@ from threading import Thread, Event,  Condition, RLock as Lock
 from errno import ENOENT,EROFS, EEXIST, EIO
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
 
-
-TYPE_DIR= (S_IFDIR | 0644 )
-TYPE_FILE= (S_IFREG | 0644 )
+TYPE_DIR = (S_IFDIR | 0644 )
+TYPE_FILE = (S_IFREG | 0644 )
 BLOCK_SIZE = 4096
 
 CACHE_PATH = "/dev/shm/"
@@ -43,7 +45,9 @@ ROOT_ST_INFO = {
         "st_gid":   os.getgid(),
         "st_uid":   os.getuid(),
         "st_atime": common.timestamp(),
-        "st_nlink": 2
+        "st_nlink": 2,
+        "st_parent_dir":".",
+        "st_name": "/"
         }
 
 import logging
@@ -100,11 +104,16 @@ class Future(object):
 
 
 class ThreadPool(Thread):
-    def __init__(self, max_thread_num, free_thread_num, idle_seconds):
+
+    _instance_lock = Lock()
+
+    def __init__(self):
         Thread.__init__(self)
-        self.max_thread_num = max_thread_num
-        self.free_thread_num = free_thread_num
-        self.idle_seconds = idle_seconds
+        from config import Config
+        configobj = Config()
+        self.max_thread_num = int(configobj.get_max_thread_num())
+        self.free_thread_num = int(configobj.get_free_thread_num())
+        self.idle_seconds = int(configobj.get_idle_seconds())
         self.runflag = False
         self.freequeue = deque()
         self.busyqueue = deque()
@@ -113,6 +122,15 @@ class ThreadPool(Thread):
         self.condition = Condition(self.lock)
         self.setDaemon(True)
         self.initpool()
+
+    @staticmethod
+    def instance():
+        if not hasattr(ThreadPool, "_instance"):
+            with ThreadPool._instance_lock:
+                if not hasattr(ThreadPool, "_instance"):
+                    ThreadPool._instance = ThreadPool()
+        return ThreadPool._instance
+
 
     def initpool(self):
         for workerindex in range(self.free_thread_num):
@@ -130,6 +148,7 @@ class ThreadPool(Thread):
         while 1:
             with self.condition:
                 if len(self.busyqueue) > 0:
+                    logger.debug("wait quit......")
                     self.condition.wait()
                 else:
                     break
@@ -139,13 +158,11 @@ class ThreadPool(Thread):
             task.waitdone()
             
         with self.lock:
-            while not self.runflag:pass
             self.runflag = False    
 
     def __createworker(self):
-        worker = Worker(self)
+        worker = Worker()
         self.freequeue.append(worker)
-        worker.start()
         return worker
 
     def __dotaskinworker(self, callable_, *args, **kwargs):
@@ -183,7 +200,6 @@ class ThreadPool(Thread):
             all_threadsize = idle_threadsize + busy_threadsize
 
             if idle_threadsize > 0:
-                '''有空闲的线程可用'''
                 return self.__dotaskinworker(callable_, *args, **kwargs)
 
             elif idle_threadsize == 0 and all_threadsize < self.max_thread_num:
@@ -191,13 +207,11 @@ class ThreadPool(Thread):
                 return self.__dotaskinworker(callable_, *args, **kwargs)
 
             elif idle_threadsize == 0 and all_threadsize == self.max_thread_num:
-                '''没有空闲线程，且已经不能增加新的线程, 等待可用任务'''
                 logger.debug("no available thread, wait for notify...")
                 self.condition.wait()
                 return self.__dotaskinworker(callable_, *args, **kwargs)
 
     def taskdone(self, worker):
-        '''给worker线程调用，通知该线程处于idle状态'''
         with self.condition:
             self.condition.notify()
             logger.debug("worker:(%s) task done" % str(worker))
@@ -207,6 +221,7 @@ class ThreadPool(Thread):
 
     def run(self):
         lastcleantime = time.time()
+        self.runflag = True
         while self.runflag:
             with self.lock:
                 if time.time() - lastcleantime > self.idle_seconds:
@@ -227,18 +242,19 @@ class ThreadPool(Thread):
                         self.peroidic(callable_.callablefunc, timeoutvalue)
 
             time.sleep(0.1)
+        logger.debug("threadpool exited!")
 
 
 class Worker(Thread, Future):
-    '''用来执行指定的任务'''
-    def __init__(self, threadpool):
+    def __init__(self):
         Thread.__init__(self)
+        Future.__init__(self)
         self.status = "FREE"
         self.taskqueue = Queue(2)
         self.lastupdate = time.time()
-        self.threadpool = threadpool
         self.notify = lambda noop:noop
         self.setDaemon(True)
+        self.start()
 
     def execute(self, callable_, *args, **kwargs):
         self.status = "BUSY"
@@ -275,7 +291,7 @@ class Worker(Thread, Future):
                     self.status = "FREE"
                     logger.error(taskex)
                 finally:
-                    self.threadpool.taskdone(self)
+                    ThreadPool.instance().taskdone(self)
                     
 
 class TaskPool(object):
@@ -283,7 +299,7 @@ class TaskPool(object):
         self.uploadpool = {}
         self.downloadpool = {}
         self.uploadlock, self.downlock = Lock(), Lock()
-        self.taskclass = {"upload":WriteTask,"download":DownloadTask, "fusetask":FuseTask}
+        self.taskclass = {"upload":WriteTask, "download":DownloadTask, "fusetask":FuseTask}
 
     def upload_file(self, hashpath, *args):
         return self.__new_task("upload", hashpath, *args)
@@ -336,6 +352,69 @@ class TaskPool(object):
             if pool.has_key(key):
                return pool[key]
 
+class WalkAroundTreeTask(Future):
+
+    def __init__(self, api, path):
+        Future.__init__(self)
+        self.api = api
+        self.path = path
+
+    def readdir(self, path):
+        return self.api.metadata(path=path)
+
+    def listdir(self, path, allfilesinfo):
+        dirs = []
+        result = self.readdir(path)
+        if result.status_code != 200:
+            return dirs
+
+        result = result.json()
+        for finfo in result["files"]:
+            fullpath = os.path.join(path, finfo["name"])
+
+            st_info = {
+                        "st_mtime": common.to_timestamp(finfo["modify_time"]),
+                        "st_mode":  TYPE_FILE if finfo["type"] == "file" else TYPE_DIR,
+                        "st_size":  int(finfo["size"]) if finfo["type"] == "file" else 4096,
+                        "st_gid":   os.getgid(),
+                        "st_uid":   os.getuid(),
+                        "st_atime": common.timestamp(),
+                        "st_parent_dir": path,
+                        "st_name": finfo["name"]
+                    }
+
+            allfilesinfo[fullpath] = st_info
+
+            print("%s" % fullpath)
+            if finfo["type"] == "file":
+                dirs.append((fullpath, "file"))
+            else:
+                dirs.append((fullpath, "dir"))
+        return dirs        
+
+    def walk(self, root):
+        stack = []
+        stack.append(root)
+        allfilesinfo = {}
+
+        while 1:
+            if len(stack) == 0:break
+            cwd = stack.pop(0)
+            try:
+                files = self.listdir(cwd, allfilesinfo)
+                for f in files:
+                    name, nodetype = f
+                    path = os.path.join(cwd, name)
+
+                    if nodetype == "dir":
+                        stack.append(path)
+            except:
+                pass
+        return allfilesinfo
+
+    def __call__(self, *args):
+        return self.walk(self.path)                
+
 class FuseTask(Future):
     def __init__(self, method, api, *args, **kwargs):
         Future.__init__(self)
@@ -353,7 +432,7 @@ class FuseTask(Future):
                 logger.debug("method %s" % self.method)
                 return (True, result.json())
             else:
-                return (False,FuseOSError(EIO))
+                return (False, FuseOSError(EIO))
         except Exception ,e:
             _, exc, trace = sys.exc_info()
             logger.error(exc)
@@ -376,11 +455,11 @@ class FuseTask(Future):
 
     def accountinfo(self):
         return self.api.account_info()
- 
+
 
 class DownloadTask(Thread, Future):
 
-    def __init__(self, api, hashpath, path, bufsize,notify):
+    def __init__(self, api, hashpath, path, bufsize, notify):
         Thread.__init__(self)
         Future.__init__(self)
         self.api = api
@@ -393,7 +472,7 @@ class DownloadTask(Thread, Future):
         self.downloadbytes = 0
         self.lock = Lock()
 
-    def wait_data(self,size):
+    def wait_data(self, size):
         self.waiter.wait()
         with self.lock:
             if self.isfirst:
@@ -426,7 +505,7 @@ class DownloadTask(Thread, Future):
 
 class WriteTask(Thread, Future):
 
-    def __init__(self, api, hashpath, path, filename, data, offset, notify):
+    def __init__(self, api, hashpath, path, filename, data, offset, uploadqueue, notify):
         Thread.__init__(self)
         Future.__init__(self)
         self.api = api
@@ -438,6 +517,7 @@ class WriteTask(Thread, Future):
         self.cmd = Queue(1000)
         self.cmd.put(("start_upload_file",(data, offset)))
         self.notify = notify
+        self.uploadqueue = uploadqueue
         self.clsname = "_" + self.__class__.__name__
 
     def sendmesg(self, cmd):
@@ -497,6 +577,7 @@ class WriteTask(Thread, Future):
             self.is_finished = True
             self.notify(self.result)
             self.__dropcache()
+            del self.uploadqueue[self.hashpath]
 
     def __dropcache(self):
         try:
@@ -532,12 +613,25 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         self.fd = 0
         self.fileprops = {"/":ROOT_ST_INFO}
         self.taskpool = TaskPool()
-        self.threadpool = ThreadPool(20, 10, 120)
         self.rootfiles = []
         self.cwd = ''
         self.rlock = Lock()
         self.quota = {"f_blocks":0, "f_bavail":0}
+        self.walked = False
+        self.initkuaipan()
+        #用来保存尚未上传完成的文件,如果上传完后，需要从这里删除上传完成的文件
+        self.uploadqueue = {}
 
+    def initkuaipan(self):
+        localtree = self.loadtree()
+        if localtree: 
+            self.fileprops = localtree
+        threadpool = ThreadPool.instance()
+        threadpool.delay(self.setaccountinfo, 0)
+        threadpool.peroidic(self.setaccountinfo, 300)
+        threadpool.delay(self.updatefileprops, 0)
+
+        
     def __call__(self, op, *args):
         try:
             return super(KuaiPanFuse, self).__call__(op, *args)
@@ -553,79 +647,43 @@ class KuaiPanFuse(LoggingMixIn, Operations):
             try:
                 _, quota = result
                 totalspace, usedspace = quota["quota_total"], quota["quota_used"]
-                f_blocks = totalspace / BLOCK_SIZE
                 availspace = totalspace - usedspace
-                f_bavail = availspace / BLOCK_SIZE
-                self.quota["f_blocks"] = int(f_blocks)
-                self.quota["f_bavail"] = int(f_bavail)
+                self.quota["f_blocks"] = totalspace / BLOCK_SIZE
+                self.quota["f_bavail"] = availspace / BLOCK_SIZE
                 logger.debug("totalspace=%d, usedspace=%d" % (totalspace, usedspace))
             except:
                 pass
 
-        future = self.threadpool.submit(FuseTask("accountinfo", self.api))
+        future = ThreadPool.instance().submit(FuseTask("accountinfo", self.api))
         result = future.get()
         logger.debug(result)
         updatediskquota(result)
 
+    def updatefileprops(self):
+        with self.rlock:
+            future = ThreadPool.instance().submit(WalkAroundTreeTask(self.api, "/"))
+            allfilesinfo = future.get()
+            allfilesinfo.update({"/":ROOT_ST_INFO})
+            self.fileprops.update(allfilesinfo)
+
 
     def listdir(self, path=None):
-        '''
-        [{u'create_time': u'2014-06-26 14:50:00',
-             u'file_id': u'7774526460920101',
-             u'is_deleted': False,
-             u'modify_time': u'2014-06-26 14:50:00',
-             u'name': u'Deploying.OpenStack.Jul.2011.pdf',
-             u'rev': u'1',
-             u'sha1': u'87f2d5506fafffbc2928404ee5fe7ea118cc2ca8',
-             u'share_id': u'0',
-             u'size': 6199737,
-             u'type': u'file'}]
-
-
-             容易使用的结构
-             {"path":st_info}
-        '''
-        with self.rlock:
-            self.threadpool.delay(self.setaccountinfo, 5)
-            future = self.threadpool.submit(FuseTask("readdir", self.api, path))
-            success, result = future.get()
-            logger.debug((success, result))
-            if not success: raise result
-            self.cwd = path
-            for finfo in result["files"]:
-                path_as_key = path + finfo["name"] if path == "/" else path + "/" + finfo["name"]
-                st_info = {
-                            "st_mtime": common.to_timestamp(finfo["modify_time"]),
-                            "st_mode":  TYPE_FILE if finfo["type"] == "file" else TYPE_DIR,
-                            "st_size":  int(finfo["size"]) if finfo["type"] == "file" else 4096,
-                            "st_gid":   os.getgid(),
-                            "st_uid":   os.getuid(),
-                            "st_atime": common.timestamp(),
-                        }
-                self.fileprops[path_as_key] = st_info
-
-            allfiles = ['.','..']
-
-            for remotefile in result["files"]:
-                allfiles.append(remotefile["name"])
-
-            self.rootfiles = allfiles
-            return allfiles
+        if self.walked:
+            return 
+        else:
+            self.walked = True
 
     def chmod(self, path, mode):
         logger.debug("chmod %s" % path)
 
+    def __listfiles(self, path):
+        allfiles = ['.','..']
+        for remotefile in filter(lambda node:node["st_parent_dir"] == path and node["st_name"] != '/', self.fileprops.itervalues()):
+            allfiles.append(remotefile["st_name"])
+        return allfiles
+
     def readdir(self, path, fh):
-        with self.rlock:
-            if self.rootfiles:
-                logger.debug("return self.rootfiles")
-                logger.debug(self.rootfiles)
-                logger.debug(self.fileprops)
-                return self.rootfiles
-            else:
-                logger.debug("return default files")
-                logger.debug(self.fileprops)
-                return ['.','..']
+        return self.__listfiles(path)
 
     def getattr(self, path, fh=None):
         ''' 'st_atime', 'st_ctime', 'st_gid', 'st_mode', 'st_mtime', 'st_nlink', 'st_size', 'st_uid' '''
@@ -647,7 +705,7 @@ class KuaiPanFuse(LoggingMixIn, Operations):
             return downloadtask.wait_data(size)
 
     def unlink(self, path):
-        self.threadpool.submit(FuseTask("unlink", self.api, path))
+        ThreadPool.instance().submit(FuseTask("unlink", self.api, path))
         self.__cleancache(path)
         return 0
 
@@ -657,16 +715,24 @@ class KuaiPanFuse(LoggingMixIn, Operations):
 
     def rename(self, oldpath, newpath):
         with self.rlock:
-            self.threadpool.submit(FuseTask("rename", self.api, oldpath, newpath))
+            #判断当前上传队列中是否有同path的文件正在上传，如果是的话，需要等待，待当前文件上传完成后才可以发出rename命令
+            hashpath = sha1(oldpath.encode("utf-8")).hexdigest().strip()
+
+            while hashpath in self.uploadqueue:
+                time.sleep(0.01)
+
+            ThreadPool.instance().submit(FuseTask("rename", self.api, oldpath, newpath))
             oldinfo = self.fileprops[oldpath]
             self.fileprops[newpath] = oldinfo
-            del self.fileprops[oldpath]
+            self.__addcache(newpath, oldinfo["st_mode"])
+            self.__cleancache(oldpath)
 
     def __isdir(self, path):
         return self.fileprops[path]["st_mode"] == TYPE_DIR
 
     def __isfile(self, path):
         return self.fileprops[path]["st_mode"] == TYPE_FILE
+
 
     def access(self, path, mode):
         if self.__isdir(path):
@@ -681,7 +747,7 @@ class KuaiPanFuse(LoggingMixIn, Operations):
                 raise FuseOSError(ENOENT)
             return 0
         elif path in self.fileprops:
-            return 0
+            return 
         else:
             raise FuseOSError(EROFS)
 
@@ -714,14 +780,14 @@ class KuaiPanFuse(LoggingMixIn, Operations):
                 fileinfo = copy.copy(ROOT_ST_INFO)
                 fileinfo["st_mode"] = TYPE_FILE
                 fileinfo["st_nlink"] = 1
+                fileinfo["st_parent_dir"] = os.path.dirname(path)
+                fileinfo["st_name"] = os.path.basename(path)
                 self.fileprops[path] = fileinfo
-                dirname = os.path.dirname(path)
-                if dirname == self.cwd:
-                    self.rootfiles.append(os.path.basename(path))
             else:
                 dirinfo = copy.copy(ROOT_ST_INFO)
+                dirinfo["st_parent_dir"] = os.path.dirname(path)
+                dirinfo["st_name"] = os.path.basename(path)
                 self.fileprops[path] = dirinfo
-                self.rootfiles.append("".join(path[1:]))
 
 
     def __updatefilesize(self, path, size):
@@ -732,18 +798,19 @@ class KuaiPanFuse(LoggingMixIn, Operations):
                 logger.debug("update %s size to %d" % (path, size))
 
     def rmdir(self, path):
-        self.threadpool.submit(FuseTask("rmdir", self.api, path))
+        ThreadPool.instance().submit(FuseTask("rmdir", self.api, path))
         self.__cleancache(path)
         return 0
 
     def mkdir(self, path, mode):
-        self.threadpool.submit(FuseTask("mkdir", self.api, path))
+        ThreadPool.instance().submit(FuseTask("mkdir", self.api, path))
         self.__addcache(path, TYPE_DIR)
 
     def link(self, source ,target):
         return 0
 
     def create(self, path, mode, fi=None):
+        logger.debug("create new file %s" % path)
         self.__addcache(path, TYPE_FILE)
         self.fd += 1
         return self.fd
@@ -755,7 +822,8 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         if writetask:
             writetask.push_upload_file(data, offset)
         else:
-            self.taskpool.upload_file(hashpath, self.api, path, filename, data, offset)
+            self.taskpool.upload_file(hashpath, self.api, path, filename, data, offset, self.uploadqueue)
+            self.uploadqueue[hashpath] = path
         return len(data)
 
 
@@ -773,7 +841,6 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         return 0
 
     def statfs(self, path):
-        logger.debug("statvfs %s" % path)
         logger.debug(self.quota)
         return dict(
                     f_bsize=BLOCK_SIZE, 
@@ -783,19 +850,37 @@ class KuaiPanFuse(LoggingMixIn, Operations):
                     f_bavail=self.quota["f_blocks"]
                     )
         
+    def loadtree(self):
+        from pkg_resources import resource_filename
+        filename = resource_filename("kuaipandriver", "tree.db")
+        if os.path.exists(filename):
+            from pickle import load
+            return load(file(filename))
+
+    def savetree(self):
+        from pkg_resources import resource_filename
+        filename = resource_filename("kuaipandriver", "tree.db")
+        if not self.fileprops:
+            pass
+        with open(filename, "w") as treefile:
+            from pickle import dump
+            dump(self.fileprops, treefile)
 
     def destroy(self, path):
-        pass
-
+        logger.debug("fuse exited!")
+        self.savetree()
 
 def main():
+    ThreadPool.instance().start()
     from kuaipandriver.kuaipanapi import KuaipanAPI
     from kuaipandriver.common import getauthinfo
     from requests.exceptions import RequestException
+    islogin = False
     while 1:
         try:
             mntpoint, key, secret, user, pwd = getauthinfo()
             api = KuaipanAPI(mntpoint, key, secret, user, pwd)
+            islogin = True
             break
         except RequestException:
             retry = raw_input("Your Login info already wrong, do you want to re enter it?(Y/N)")
@@ -806,6 +891,8 @@ def main():
                 break
 
     try:
+        if not islogin:
+            return
         FUSE(
                 KuaiPanFuse(api), mntpoint, foreground=True, nothreads=False, 
                 debug=False, big_writes=True, gid=os.getgid(), uid=os.getuid(), 
@@ -813,3 +900,7 @@ def main():
             )
     except RuntimeError as err:
         print str(err)
+
+
+if __name__ == '__main__':
+    main()
