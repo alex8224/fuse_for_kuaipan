@@ -185,7 +185,7 @@ class KuaipanAPI(object):
             fd = req_download.raw
             count = 0
             bufsize = bufsize
-            isfirst=True
+            isfirst = True
             yield
             while 1:
                 if isfirst:
@@ -201,6 +201,8 @@ class KuaipanAPI(object):
                     bufsize = (yield buff)
                 count += len(buff)
         except Exception, e:
+            import traceback
+            traceback.print_exc()
             raise OpenAPIError(e)
 
 

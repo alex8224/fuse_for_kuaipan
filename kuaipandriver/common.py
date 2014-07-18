@@ -95,6 +95,7 @@ def safe_value(v):
         return v
 
 def getauthinfo():
+    '''get login information from local disk or stdin'''
     from kuaipandriver.common import getloginfromlocal
     loginfo = getloginfromlocal()
     if loginfo:
@@ -109,12 +110,14 @@ def getauthinfo():
     return mntpoint, key, secret, username, pwd
 
 def getloginfromlocal():
+    '''get login information from local disk'''
     infofilepath= os.path.expanduser("~") + "/.kuaipandriver"
     if os.path.exists(infofilepath):
         import pickle
         return pickle.load(file(infofilepath))
 
 def savelogin(mntpoint, key, secret, username, pwd):
+    '''save login information to home directory ~/.kuaipandriver'''
     import os
     infofilepath = expanduser("~") + "/.kuaipandriver"
     if os.path.exists(infofilepath):
