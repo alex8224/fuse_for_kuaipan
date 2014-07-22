@@ -1006,7 +1006,7 @@ def main():
         if not islogin:
             return
         FUSE(
-                KuaiPanFuse(api), mntpoint, foreground=True, nothreads=False, 
+                KuaiPanFuse(api), mntpoint, foreground=False, nothreads=False, 
                 debug=False, big_writes=True, gid=os.getgid(), uid=os.getuid(), 
                 umask='0133'
             )
