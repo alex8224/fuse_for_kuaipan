@@ -176,6 +176,16 @@ class KuaipanAPI(object):
         return requests.get(sig_req_url)
 
     @catchexception
+    def download_file1(self, filepath):
+        attach = {"path":filepath, "root":"app_folder"}
+        sig_req_url = self.__get_sig_url("download", attachdata=attach)
+        try:
+            req_download = requests.get(sig_req_url,stream=True)
+            return req_download.raw
+        except RequestException, e:
+            raise OpenAPIError(e) 
+
+    @catchexception
     def download_file(self, filepath, bufsize=0):
         attach = {"path":filepath, "root":"app_folder"}
         sig_req_url = self.__get_sig_url("download", attachdata=attach)

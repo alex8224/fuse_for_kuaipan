@@ -21,16 +21,15 @@ import time
 import copy
 import signal
 import common
-import traceback
+from Queue import Queue
 from hashlib import sha1
 from functools import partial
 from collections import deque
-from Queue import Queue, Empty
 from stat import S_IFDIR, S_IFREG
 from kuaipanapi import OpenAPIError, OpenAPIException
-from threading import Thread, Event,  Condition, RLock as Lock
+from threading import Thread, Condition, currentThread, RLock as Lock
 from errno import ENOENT, EROFS, EEXIST, EIO
-from fuse import FUSE, FuseOSError, Operations, LoggingMixIn
+from fuse import FUSE, FuseOSError, Operations, LoggingMixIn, fuse_get_context
 
 TYPE_DIR = (S_IFDIR | 0644 )
 TYPE_FILE = (S_IFREG | 0644 )
@@ -142,7 +141,6 @@ class ThreadPool(Thread):
         while 1:
             with self.condition:
                 if len(self.busyqueue) > 0:
-                    logger.debug("wait quit......")
                     self.condition.wait()
                 else:
                     break
@@ -163,7 +161,7 @@ class ThreadPool(Thread):
         worker = self.freequeue.popleft()
         self.busyqueue.append(worker)
         worker.execute(callable_, *args, **kwargs)
-        return self.future(callable_)
+        return self.future(callable_, worker)
 
     def delay(self, callable_, timeout):
         '''schedule a delay task'''
@@ -179,14 +177,14 @@ class ThreadPool(Thread):
             _peroidicwrapper.callablefunc = callable_
             self.delayqueue.append((time.time(), interval, _peroidicwrapper))
 
-    def future(self, callable_):
+    def future(self, callable_, worker):
         '''get future result'''
         if issubclass(callable_.__class__, Future):
             return callable_
+        else:
+            return worker
 
     def submit(self, callable_, *args, **kwargs):
-        if not callable(callable_):
-            raise TypeError("%s not a callable object" % str(callable_))
 
         with self.lock:
 
@@ -236,9 +234,8 @@ class ThreadPool(Thread):
                     if hasattr(callable_, "callablefunc"):
                         self.peroidic(callable_.callablefunc, timeoutvalue)
 
+            
             time.sleep(0.1)
-        logger.debug("threadpool exited!")
-
 
 class Worker(Thread, Future):
     def __init__(self):
@@ -248,8 +245,14 @@ class Worker(Thread, Future):
         self.taskqueue = Queue(2)
         self.lastupdate = time.time()
         self.notify = lambda noop:noop
+        self.tasktype = "callable"
         self.setDaemon(True)
         self.start()
+        self.interactivequeue = Queue()
+
+
+    def sendmesg(self, methodname, mesg):
+        self.interactivequeue.put((methodname,mesg))
 
     def execute(self, callable_, *args, **kwargs):
         self.status = "BUSY"
@@ -267,6 +270,39 @@ class Worker(Thread, Future):
                 else:
                     self.waitobj.wait()
 
+    def runasinteractive(self, task):
+
+        self.status = "RUNNING"
+        while 1:
+            methodname, args = self.interactivequeue.get()
+            if methodname == "end_task":
+                logger.debug("interactive terminated")
+                self.status = "FREE"
+                self.lastupdate = time.time()
+                ThreadPool.instance().taskdone(self)
+                break
+            if hasattr(task, methodname):
+                method = getattr(task, methodname)
+                method(*args)
+            else:
+                logger.error("no such method %s" % methodname)
+
+    def runascallable(self, task, *args, **kwargs):
+        try:
+           self.status = "RUNNING"
+           result = task(*args, **kwargs)
+           task.set_result(result)
+           self.status = "FREE"
+           self.lastupdate = time.time()
+        except Exception, taskex:
+           task.set_result(result)
+           self.status = "FREE"
+           logger.error(taskex)
+        finally:
+           ThreadPool.instance().taskdone(self)
+
+        pass
+
     def run(self):
         while 1:
             cmd, task, args, kwargs = self.taskqueue.get()
@@ -275,29 +311,37 @@ class Worker(Thread, Future):
                 self.lastupdate = time.time()
                 break
             else:
-                try:
-                    self.status = "RUNNING"
-                    result = task(*args, **kwargs)
-                    task.set_result(result)
-                    self.status = "FREE"
-                    self.lastupdate = time.time()
-                except Exception, taskex:
-                    task.set_result(result)
-                    self.status = "FREE"
-                    logger.error(taskex)
-                finally:
-                    ThreadPool.instance().taskdone(self)
+                if callable(task):
+                    self.runascallable(task, *args, **kwargs)
+                else:
+                    self.runasinteractive(task)
                     
-
+                   
 class TaskPool(object):
     def __init__(self):
         self.uploadpool = {}
         self.downloadpool = {}
         self.uploadlock, self.downlock = Lock(), Lock()
-        self.taskclass = {"upload":WriteTask, "download":DownloadTask, "fusetask":FuseTask}
+        self.taskclass = {"upload":WriteTask, "download":DownloadTask}
 
     def upload_file(self, hashpath, *args):
-        return self.__new_task("upload", hashpath, *args)
+        params = list(args)
+        params.insert(1, hashpath)
+        task = ThreadPool.instance().submit(WriteTask(*params))
+        self.uploadpool[hashpath] = task
+        return task
+
+    def query_upload_task1(self, key):
+        if key in self.uploadpool:
+            return self.uploadpool[key]
+
+    def delete_upload_task(self, key):
+        if key in self.uploadpool:
+            del self.uploadpool[key]
+
+    def delete_download_task(self, key):
+        if key in self.downloadpool:
+            del self.downloadpool[key]
 
     def download_file(self, hashpath, *args):
         return self.__new_task("download", hashpath, *args)
@@ -453,59 +497,143 @@ class FuseTask(Future):
         return self.api.account_info()
 
 
-class DownloadTask(Thread, Future):
+# class DownloadTask(Thread):
+    # def __init__(self, api, hashpath, path, bufsize, notify):
+        # Thread.__init__(self)
+        # self.api = api
+        # self.path = path
+        # self.hashpath = hashpath
+        # self.condi = Condition()
+        # self.downloadbytes = 0
+        # self.finished = False
+        # import tempfile
+        # self.tmpfilename = tempfile.mktemp()
+        # self.continueread = True
+        # self.setDaemon(True)
+
+    # def wait_data(self, size, offset):
+        # while self.continueread:
+            # with self.condi:
+                # if offset < self.downloadbytes:
+                    # with open(self.tmpfilename) as ronlyfile:
+                        # ronlyfile.seek(offset)
+                        # return ronlyfile.read(size)
+                # elif self.finished:
+                    # break
+                # else:
+                    # self.condi.wait(5)
+                    # logger.debug("%d:%d:%d:%s" % (offset, size, self.downloadbytes, self.tmpfilename))
+
+    # def end_download_file(self):
+        # with self.condi:
+            # self.continueread = False
+            # self.condi.notify_all()
+            # logger.debug("clean cache %s" % self.tmpfilename)
+            # if os.path.exists(self.tmpfilename):
+                # os.unlink(self.tmpfilename)
+
+    # def run(self):
+        # self.stream = self.api.download_file1(self.path)
+        # with open(self.tmpfilename, "w") as tempfile:
+            # while 1:
+                # data = self.stream.read(8192)
+                # if not data:
+                    # break
+                # tempfile.write(data)
+                # tempfile.flush()
+                # with self.condi:
+                    # self.downloadbytes += len(data)
+                    # self.condi.notify_all()
+        # self.stream.close()
+        # with self.condi: 
+            # self.finished = True
+            # self.condi.notify_all()
+        # logger.debug("%s download ok, hashpath:%s" % (self.path, self.hashpath))
+
+# class DownloadTask(Thread, Future):
+
+    # def __init__(self, api, hashpath, path, bufsize, notify):
+        # Thread.__init__(self)
+        # Future.__init__(self)
+        # self.api = api
+        # self.path = path
+        # self.hashpath = hashpath
+        # from threading import Event
+        # self.waiter = Event()
+        # self.isfirst = True
+        # self.bufsize = bufsize
+        # self.notify = notify
+        # self.downloadbytes = 0
+        # self.lock = Lock()
+        # self.waitobj = Condition(self.lock)
+
+    # def wait_data(self, size):
+        # self.waiter.wait()
+        # with self.lock:
+            # if self.isfirst:
+                # self.buffgen.send(None)
+                # firstdata = self.buffgen.send(self.bufsize)
+                # self.downloadbytes += len(firstdata)
+                # self.isfirst = False
+                # return firstdata
+            # else:
+                # try:
+                    # data = self.buffgen.send(size)
+                    # self.downloadbytes += len(data)
+                    # return data
+                # except StopIteration:
+                    # logger.error("gen stoped============================")
+                    # self.buffgen.close()
+                # except Exception, e:
+                    # import traceback
+                    # traceback.print_exc()
+
+    # def end_download_file(self):
+        # logger.debug("file %s download completed, %d bytes downloaded, key %s" % (self.path, self.downloadbytes, self.hashpath))
+        # with self.lock:
+            # self.notify()
+            # self.buffgen.close()
+
+    # def run(self):
+        # logger.debug("start download %s" % self.path)
+        # with self.lock:
+            # self.buffgen = self.api.download_file(self.path, self.bufsize)
+            # self.waiter.set()
+
+class DownloadTask(object):
 
     def __init__(self, api, hashpath, path, bufsize, notify):
-        Thread.__init__(self)
-        Future.__init__(self)
         self.api = api
         self.path = path
-        self.hashpath = hashpath
-        self.waiter = Event()
-        self.isfirst = True
-        self.bufsize = bufsize
-        self.notify = notify
-        self.downloadbytes = 0
+        self.stream = None
         self.lock = Lock()
-        self.waitobj = Condition(self.lock)
 
     def wait_data(self, size):
-        self.waiter.wait()
         with self.lock:
-            if self.isfirst:
-                self.buffgen.send(None)
-                firstdata = self.buffgen.send(self.bufsize)
-                self.downloadbytes += len(firstdata)
-                self.isfirst = False
-                return firstdata
+            if self.stream:
+                return self.stream.read(size)
             else:
-                try:
-                    data = self.buffgen.send(size)
-                    self.downloadbytes += len(data)
-                    return data
-                except StopIteration:
-                    logger.error("gen stoped============================")
-                    self.buffgen.close()
-                except Exception, e:
-                    traceback.print_exc()
+                logger.debug("stream not init. expect size is:%d" % size)
+
+    def close_stream(self):
+        with self.lock:
+            if self.stream:
+                self.stream.close()
 
     def end_download_file(self):
-        logger.debug("file %s download completed, %d bytes downloaded, key %s" % (self.path, self.downloadbytes, self.hashpath))
         with self.lock:
-            self.notify()
-            self.buffgen.close()
+            logger.debug("file %s download completed" % (self.path, ))
+            self.close_stream()
 
-    def run(self):
-        logger.debug("start download %s" % self.path)
+    def start(self):
         with self.lock:
-            self.buffgen = self.api.download_file(self.path, self.bufsize)
-            self.waiter.set()
+            logger.debug("start download %s" % self.path)
+            self.stream = self.api.download_file1(self.path)
 
-class WriteTask(Thread, Future):
 
-    def __init__(self, api, hashpath, path, filename, data, offset, uploadqueue, notify):
-        Thread.__init__(self)
-        Future.__init__(self)
+class WriteTask(object):
+
+    def __init__(self, api, hashpath, path, filename, uploadqueue):
         self.api = api
         self.hashpath = hashpath
         self.path = path
@@ -513,19 +641,11 @@ class WriteTask(Thread, Future):
         self.fullpath = CACHE_PATH + hashpath
         self.writebytes = 0
         self.filesize = 0
-        self.cmd = Queue(1000)
-        self.cmd.put(("start_upload_file",(data, offset)))
-        self.notify = notify
         self.uploadqueue = uploadqueue
         self.clsname = "_" + self.__class__.__name__
 
-    def sendmesg(self, cmd):
-        self.cmd.put(cmd)
 
     def start_upload_file(self, data, offset):
-        self.sendmesg(("start_upload_file", (data, offset)))
-
-    def __start_upload_file(self, data, offset):
         if os.path.exists(self.fullpath):
             os.unlink(self.fullpath)
 
@@ -533,19 +653,15 @@ class WriteTask(Thread, Future):
             f.seek(offset)
             f.write(data)
 
-    def push_upload_file(self, data, offset):
-        self.sendmesg(("push_upload_file", (data, offset)))
 
-    def __push_upload_file(self, data, offset):
+    def push_upload_file(self, data, offset):
         if os.path.exists(self.fullpath):
             with open(self.fullpath, "a") as f:
                 f.seek(offset)
                 f.write(data)
 
-    def end_upload_file(self):
-        self.sendmesg(("end_upload_file", ()))
 
-    def __end_upload_file(self):
+    def end_upload_file(self):
         def upload_file():
             try:
                 logger.debug("start upload file %s to kuaipan server" % self.path)
@@ -572,9 +688,6 @@ class WriteTask(Thread, Future):
             import traceback;traceback.print_exc()
             logger.error("file %s upload failed, the reason is %s, please upload this file manual" % (self.filename, str(e)))
         finally:
-            self.sendmesg("quit")
-            self.is_finished = True
-            self.notify(self.result)
             self.__dropcache()
             if self.hashpath in self.uploadqueue:
                 del self.uploadqueue[self.hashpath]
@@ -585,25 +698,6 @@ class WriteTask(Thread, Future):
         except Exception, e:
             logger.error(e)
 
-    def __callmethod(self, mesg):
-        methodname, args = mesg
-        internalmethod = self.clsname + "__" + methodname
-        if hasattr(self, internalmethod):
-            return getattr(self, internalmethod)(*args)
-        else:
-            logger.error("no such method %s, params: %s" % (methodname, args))
-
-    def run(self):
-        logger.debug("write task for %s started!" % self.path)
-        while 1:
-            try:
-                cmd = self.cmd.get()
-                if cmd != "quit":
-                    self.__callmethod(cmd)
-                else:
-                    break
-            except Empty:
-                pass
 
 class KuaiPanFuse(LoggingMixIn, Operations):
 
@@ -618,20 +712,23 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         self.rlock = Lock()
         self.quota = {"f_blocks":0, "f_bavail":0}
         self.walked = False
-        self.initkuaipan()
-        #用来保存尚未上传完成的文件,如果上传完后，需要从这里删除上传完成的文件
         self.uploadqueue = {}
 
     def initkuaipan(self):
         localtree = self.loadtree()
-
         logger.debug(localtree)
+
         if localtree: 
             self.fileprops = localtree
+        else:
+            logger.warn("no tree.db")
+            import pdb;pdb.set_trace()
+
+        ThreadPool.instance().start()
         threadpool = ThreadPool.instance()
         threadpool.delay(self.setaccountinfo, 0)
         threadpool.peroidic(self.setaccountinfo, 300)
-        threadpool.delay(self.updatefileprops, 10)
+        threadpool.delay(self.updatefileprops, 1)
 
         
     def __call__(self, op, *args):
@@ -642,6 +739,12 @@ class KuaiPanFuse(LoggingMixIn, Operations):
                 raise FuseOSError(EIO)
             else:
                 raise
+
+
+    def init(self, path):
+        logger.debug("fuse system already started!")
+        self.initkuaipan()
+
 
     def setaccountinfo(self):
 
@@ -667,11 +770,6 @@ class KuaiPanFuse(LoggingMixIn, Operations):
             allfilesinfo = future.get()
             allfilesinfo.update({"/":ROOT_ST_INFO})
             self.fileprops = allfilesinfo
-
-    def listdir(self, path=None):
-        if self.walked:
-            return 
-        else:
             self.walked = True
 
     def chmod(self, path, mode):
@@ -682,6 +780,13 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         for remotefile in filter(lambda node:node["st_parent_dir"] == path and node["st_name"] != '/', self.fileprops.itervalues()):
             allfiles.append(remotefile["st_name"])
         return allfiles
+
+    def __hashpath(self, path, enablepid=False):
+        uid, gid, pid = fuse_get_context()
+        if enablepid:
+            return sha1(path.encode("utf-8")).hexdigest().strip() + "_" + str(pid)
+        else:
+            return sha1(path.encode("utf-8")).hexdigest().strip()
 
     def readdir(self, path, fh):
         return self.__listfiles(path)
@@ -694,13 +799,13 @@ class KuaiPanFuse(LoggingMixIn, Operations):
             raise FuseOSError(ENOENT)
 
     def read(self, path, size, offset, fh):
-        hashpath = sha1(path.encode("utf-8")).hexdigest().strip()
+        uid, gid, pid = fuse_get_context()
+        hashpath = self.__hashpath(path, enablepid=True)
         downloadtask = self.taskpool.query_download_task(hashpath)
         if downloadtask:
-            logger.debug("ReEnter wait_data for file %s , require %d bytes" % (path, size))
+            # logger.debug("task already existed! pid:%d" % pid)
             return downloadtask.wait_data(size)
         else:
-            logger.debug("Create download task%s, file %s, require %d bytes" % (hashpath, path, size))
             downloadtask = self.taskpool.download_file(hashpath, self.api, path, size)
             return downloadtask.wait_data(size)
 
@@ -723,7 +828,7 @@ class KuaiPanFuse(LoggingMixIn, Operations):
             raise FuseOSError(EEXIST)
 
     def __waituploadready(self, path):
-        hashpath = sha1(path.encode("utf-8")).hexdigest().strip()
+        hashpath = self.__hashpath(path)
         while hashpath in self.uploadqueue:
             time.sleep(0.01)
 
@@ -744,22 +849,7 @@ class KuaiPanFuse(LoggingMixIn, Operations):
 
 
     def access(self, path, mode):
-        if self.__isdir(path):
-            self.listdir(path)
-            return 0
-
-        if path not in self.fileprops:
-            self.listdir(path)
-            if path in self.fileprops:
-                return 0
-            else:
-                raise FuseOSError(ENOENT)
-            return 0
-        elif path in self.fileprops:
-            return 
-        else:
-            raise FuseOSError(EROFS)
-
+        return 0 if path in self.fileprops else FuseOSError(EROFS)
 
     def __cleancache(self, path):
         with self.rlock:
@@ -807,6 +897,9 @@ class KuaiPanFuse(LoggingMixIn, Operations):
 
     def mkdir(self, path, mode):
         '''create directory'''
+        if os.path.basename(path) == ".Trash-1000":
+            raise FuseOSError(ENOENT)
+
         ThreadPool.instance().submit(FuseTask("mkdir", self.api, path))
         self.__addcache(path, TYPE_DIR)
 
@@ -819,29 +912,38 @@ class KuaiPanFuse(LoggingMixIn, Operations):
 
     def write(self, path, data, offset, ph):
         '''called by fuse try to write data to path'''
-        hashpath = sha1(path.encode("utf-8")).hexdigest().strip()
+        hashpath = self.__hashpath(path)
         filename = os.path.basename(path)
-        writetask = self.taskpool.query_upload_task(hashpath)
+        writetask = self.taskpool.query_upload_task1(hashpath)
         if writetask:
-            writetask.push_upload_file(data, offset)
+            writetask.sendmesg("push_upload_file", (data, offset))
+            self.fileprops[path]["st_size"] += len(data)
         else:
-            self.taskpool.upload_file(hashpath, self.api, path, filename, data, offset, self.uploadqueue)
-            self.uploadqueue[hashpath] = path
-        return len(data)
+            task = self.taskpool.upload_file(hashpath, self.api, path, filename, self.uploadqueue)
+            task.sendmesg("start_upload_file", (data, offset))
+            self.fileprops[path]["st_size"] = len(data)
+        return len(data)    
 
 
-    def release(self, path, fh):
-        '''called by fuse release a file'''
-        hashpath = sha1(path.encode("utf-8")).hexdigest().strip()
-        uploadtask = self.taskpool.query_upload_task(hashpath)
-        if uploadtask:
-            uploadtask.end_upload_file()
-            self.__waituploadready(path)
-            self.__updatefilesize(path, uploadtask.filesize)
-
+    def flush(self, path, fh):
+        logger.debug("flush file %s, pid is:%d" % (path, fuse_get_context()[2]))
+        hashpath = self.__hashpath(path, enablepid=True)
+        logger.debug(hashpath)
         downloadtask = self.taskpool.query_download_task(hashpath)
         if downloadtask:
             downloadtask.end_download_file()
+            self.taskpool.delete_download_task(hashpath)
+
+    def release(self, path, fh):
+        '''called by fuse release a file'''
+        hashpath = self.__hashpath(path)
+        uploadtask = self.taskpool.query_upload_task1(hashpath)
+        if uploadtask:
+            uploadtask.sendmesg("end_upload_file", ())
+            uploadtask.sendmesg("end_task", ())
+            self.__waituploadready(path)
+            self.taskpool.delete_upload_task(hashpath)
+
         return 0
 
     def statfs(self, path):
@@ -857,21 +959,24 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         
     def loadtree(self):
         '''load directory tree from local disk'''
-        from pkg_resources import resource_filename
-        filename = resource_filename("kuaipandriver", "tree.db")
-        if os.path.exists(filename):
-            from pickle import load
-            return load(file(filename))
+        with self.rlock:
+            from pkg_resources import resource_filename
+            filename = resource_filename("kuaipandriver", "tree.db")
+            if os.path.exists(filename):
+                from pickle import load
+                return load(file(filename))
 
     def savetree(self):
         '''cache directory tree to local disk'''
-        from pkg_resources import resource_filename
-        filename = resource_filename("kuaipandriver", "tree.db")
-        if not self.fileprops:
-            pass
-        with open(filename, "w") as treefile:
-            from pickle import dump
-            dump(self.fileprops, treefile)
+        with self.rlock:
+            from pkg_resources import resource_filename
+            filename = resource_filename("kuaipandriver", "tree.db")
+            if not self.fileprops:
+                pass
+            with open(filename, "w") as treefile:
+                from pickle import dump
+                dump(self.fileprops, treefile)
+                logger.debug("dump ok" + str(self.fileprops))
 
     def destroy(self, path):
         '''called by fuse destory context'''
@@ -879,7 +984,6 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         self.savetree()
 
 def main():
-    ThreadPool.instance().start()
     from kuaipandriver.kuaipanapi import KuaipanAPI
     from kuaipandriver.common import getauthinfo
     from requests.exceptions import RequestException
@@ -902,13 +1006,9 @@ def main():
         if not islogin:
             return
         FUSE(
-                KuaiPanFuse(api), mntpoint, foreground=False, nothreads=False, 
+                KuaiPanFuse(api), mntpoint, foreground=True, nothreads=False, 
                 debug=False, big_writes=True, gid=os.getgid(), uid=os.getuid(), 
                 umask='0133'
             )
     except RuntimeError as err:
         print str(err)
-
-
-if __name__ == '__main__':
-    main()
