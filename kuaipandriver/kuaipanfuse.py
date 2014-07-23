@@ -9,11 +9,8 @@
 #Description: 实现快盘的ＡＰＩ,可以实现文件的异步上传, 下载，浏览，目录操作
 # 缩略图和版本功能未实现
 # todo
-# 1. bulid entire director tree
-# from root get file list. 判断如果是目录，则继续调用ＡＰＩ，轮询该目录,如果该目录下没有其他目录，则返回上一级
-# 使用stack代替递归，how?
-# 2. make wrietask and download task managmented by threadpool
-# 3. add virtualdirectory support extend task, for example: document convert
+# 1. add virtualdirectory support extend task, for example: document convert
+# 2. support many consumerkey and consumersecret to solve api day limit
 #********************************************************************************
 import os
 import sys
@@ -27,7 +24,7 @@ from functools import partial
 from collections import deque
 from stat import S_IFDIR, S_IFREG
 from kuaipanapi import OpenAPIError, OpenAPIException
-from threading import Thread, Condition, currentThread, RLock as Lock
+from threading import Thread, Condition, RLock as Lock
 from errno import ENOENT, EROFS, EEXIST, EIO
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn, fuse_get_context
 
@@ -602,18 +599,25 @@ class FuseTask(Future):
 
 class DownloadTask(object):
 
-    def __init__(self, api, hashpath, path, bufsize, notify):
+    def __init__(self, api, hashpath, path, filesize, notify):
         self.api = api
         self.path = path
         self.stream = None
+        self.filesize = filesize
+        from requests import Session
+        self.session = Session()
         self.lock = Lock()
+        self.downloadurl = ''
+        self.initsession()
 
-    def wait_data(self, size):
+    def initsession(self):
+        self.downloadurl = self.api.get_downloadurl(self.session, self.path)
+        logger.debug("download url is %s" % self.downloadurl)
+
+    def wait_data(self, offset, size):
         with self.lock:
-            if self.stream:
-                return self.stream.read(size)
-            else:
-                logger.debug("stream not init. expect size is:%d" % size)
+            logger.debug("filesize:%d, wait_data(%d, %d)" % (self.filesize, offset, size))
+            return "".join([data for data in self.api.download_file2(self.downloadurl, self.session, self.filesize, offset, (size -1 ))])
 
     def close_stream(self):
         with self.lock:
@@ -623,12 +627,13 @@ class DownloadTask(object):
     def end_download_file(self):
         with self.lock:
             logger.debug("file %s download completed" % (self.path, ))
-            self.close_stream()
+            # self.close_stream()
+            del self.session
 
     def start(self):
         with self.lock:
             logger.debug("start download %s" % self.path)
-            self.stream = self.api.download_file1(self.path)
+            # self.stream = self.api.download_file1(self.path)
 
 
 class WriteTask(object):
@@ -722,7 +727,6 @@ class KuaiPanFuse(LoggingMixIn, Operations):
             self.fileprops = localtree
         else:
             logger.warn("no tree.db")
-            import pdb;pdb.set_trace()
 
         ThreadPool.instance().start()
         threadpool = ThreadPool.instance()
@@ -804,10 +808,11 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         downloadtask = self.taskpool.query_download_task(hashpath)
         if downloadtask:
             # logger.debug("task already existed! pid:%d" % pid)
-            return downloadtask.wait_data(size)
+            return downloadtask.wait_data(offset, size)
         else:
-            downloadtask = self.taskpool.download_file(hashpath, self.api, path, size)
-            return downloadtask.wait_data(size)
+            filesize = self.fileprops[path]["st_size"]
+            downloadtask = self.taskpool.download_file(hashpath, self.api, path, filesize)
+            return downloadtask.wait_data(offset, size)
 
     def link(self, linktarget, linkname):
         self.__waituploadready(linkname)
@@ -984,9 +989,12 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         self.savetree()
 
 def main():
+    from kuaipandriver.common import getauthinfo, checkplatform
+    checkplatform()
     from kuaipandriver.kuaipanapi import KuaipanAPI
-    from kuaipandriver.common import getauthinfo
     from requests.exceptions import RequestException
+
+
     islogin = False
     while 1:
         try:

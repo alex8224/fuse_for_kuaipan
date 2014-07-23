@@ -101,7 +101,7 @@ def getauthinfo():
     if loginfo:
         return loginfo
 
-    mntpoint = raw_input("MountPoint:")
+    mntpoint = raw_input("MountPoint(Absoluate Path):")
     key = raw_input("ConsumerKey:")
     secret = raw_input("ConsumerSecret:")
     username = raw_input("Kuaipan Login Name:")
@@ -138,3 +138,15 @@ def deleteloginfo():
         os.unlink(infofilepath)
     except:
         pass
+
+def checkplatform():
+    import sys
+    platform = sys.platform
+    if not platform.startswith("linux"):
+        sys.stderr.write("Kuaipandriver only support Linux Platform")
+        sys.exit(1)
+
+
+if __name__ == '__main__':
+    checkplatform()        
+

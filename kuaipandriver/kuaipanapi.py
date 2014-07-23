@@ -185,13 +185,40 @@ class KuaipanAPI(object):
         except RequestException, e:
             raise OpenAPIError(e) 
 
+    def get_downloadurl(self, session, filepath):
+        attach = {"path":filepath, "root":"app_folder"}
+        sig_req_url = self.__get_sig_url("download", attachdata=attach)
+        result = session.get(sig_req_url, allow_redirects=False)
+        return result.headers["location"]
+
+    @catchexception
+    def download_file2(self, downloadurl, session, filesize, offset=-1, length=-1):
+        extra_header = {}
+        if offset >-1:
+            endoffset = offset + length -1
+            if endoffset > filesize:
+                endoffset = filesize - 1
+            extra_header = {"Range":"bytes=%d-%d" % (offset, endoffset)}
+            print("got range %d-%d" % (offset, endoffset))
+
+        req_download = session.get(downloadurl, stream=True, headers = extra_header)
+        print req_download.headers
+        fd = req_download.raw
+        while 1:
+            data = fd.read(8192)
+            if data:
+                yield data
+            else:
+                break
+        
     @catchexception
     def download_file(self, filepath, bufsize=0):
         attach = {"path":filepath, "root":"app_folder"}
         sig_req_url = self.__get_sig_url("download", attachdata=attach)
-
+        print sig_req_url
         try:
             req_download = requests.get(sig_req_url,stream=True)
+            print req_download.headers
             fd = req_download.raw
             count = 0
             bufsize = bufsize
@@ -357,3 +384,14 @@ def test_doc_convert():
     else:
         print "convert failed!"
         print result.text
+
+
+if __name__ == '__main__':
+    mnt, key, secret, user, pwd = "mnt", "xchAnjnCdbjAmDVG", "xIb1iRVWEusFasLk", "alex8224@126.com", "xtgdmjq"
+    api = KuaipanAPI(mnt, key, secret, user, pwd)
+    path, offset, length = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+    session = requests.Session()
+    result = api.download_file2(path, session, offset, length)
+    data =  "".join([data for data in api.download_file2(path, session, offset, length)])
+    print data
+    print len(data)
