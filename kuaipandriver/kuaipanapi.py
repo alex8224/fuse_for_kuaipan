@@ -17,7 +17,7 @@ import requests
 from functools import wraps
 import lxml.html as html
 from kuaipandriver.config import Config
-from kuaipandriver.common import oauth_once_next
+from kuaipandriver.common import oauth_once_next, HTTPSession
 from requests.exceptions import RequestException
 
 next_oauth_once = oauth_once_next()
@@ -93,7 +93,6 @@ class KuaipanAPI(object):
         return config.get_authorize_url() % self.oauth_token
 
     def get_auth_code(self, url):
-        print(url)
         try:
             ua = "Mozilla/5.0 (X11; Linux i686) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.153 Safari/537.36"
             sess = requests.Session()
@@ -165,15 +164,19 @@ class KuaipanAPI(object):
             print(errmsg)
             sys.exit(1)
 
+
     @catchexception
     def account_info(self):
         sig_req_url = self.__get_sig_url("account_info")
         return requests.get(sig_req_url)
 
     @catchexception
-    def metadata(self,root="app_folder", path=""):
+    def metadata(self,root="app_folder", path="", session=None):
         sig_req_url = self.__get_sig_url("metadata", urlsuffix=(root, urllib.quote(path.encode("utf-8"))))
-        return requests.get(sig_req_url)
+        if session:
+            return session.get(sig_req_url)
+        else:
+            return requests.get(sig_req_url)
 
     @catchexception
     def download_file1(self, filepath):
@@ -185,31 +188,25 @@ class KuaipanAPI(object):
         except RequestException, e:
             raise OpenAPIError(e) 
 
-    def get_downloadurl(self, session, filepath):
+    def get_downloadurl(self, filepath):
         attach = {"path":filepath, "root":"app_folder"}
         sig_req_url = self.__get_sig_url("download", attachdata=attach)
-        result = session.get(sig_req_url, allow_redirects=False)
-        return result.headers["location"]
+        session = HTTPSession() 
+        result = session.get(sig_req_url, verbose=True)
+        session.close()
+        print result.headers["Location"]
+        return result.headers["Location"]
 
     @catchexception
-    def download_file2(self, downloadurl, session, filesize, offset=-1, length=-1):
-        extra_header = {}
-        if offset >-1:
-            endoffset = offset + length -1
-            if endoffset > filesize:
-                endoffset = filesize - 1
-            extra_header = {"Range":"bytes=%d-%d" % (offset, endoffset)}
-            print("got range %d-%d" % (offset, endoffset))
+    def download_file2(self, session):
+        # if offset >-1:
+            # endoffset = offset + length -1
+            # if endoffset > filesize:
+                # endoffset = filesize - 1
+            # extra_header = [("Connection: Keep-Alive"), ("Range: bytes=%d-%d" % (offset, endoffset))]
+            # print("got range %d-%d" % (offset, endoffset))
 
-        req_download = session.get(downloadurl, stream=True, headers = extra_header)
-        print req_download.headers
-        fd = req_download.raw
-        while 1:
-            data = fd.read(8192)
-            if data:
-                yield data
-            else:
-                break
+        return session.start_get()
         
     @catchexception
     def download_file(self, filepath, bufsize=0):
@@ -296,8 +293,7 @@ class KuaipanAPI(object):
     def delete(self, filename):
         attach = {"root":"app_folder","path":filename}
         sig_req_url = self.__get_sig_url("delete", attachdata=attach)
-        delete_result = requests.get(sig_req_url)
-        return delete_result
+        return requests.get(sig_req_url)
 
     @catchexception
     def copy(self, frompath, topath):
@@ -310,13 +306,11 @@ class KuaipanAPI(object):
     def move(self, frompath, topath):
         attach = {"root":"app_folder","from_path":frompath, "to_path":topath}
         sig_req_url = self.__get_sig_url("move", attachdata=attach)
-        move_result = requests.get(sig_req_url)
-        return move_result
+        return requests.get(sig_req_url)
 
     @catchexception
     def convert(self, path, viewtype):
         doctype = path[-3:]
-        print doctype
         attach = {"type":doctype, "view":viewtype, "root":"app_folder", "path":path, "zip":1}
         sig_req_url = self.__get_sig_url("convert", attachdata=attach)
         return requests.get(sig_req_url, stream=True)
@@ -387,11 +381,12 @@ def test_doc_convert():
 
 
 if __name__ == '__main__':
-    mnt, key, secret, user, pwd = "mnt", "xchAnjnCdbjAmDVG", "xIb1iRVWEusFasLk", "alex8224@126.com", "xtgdmjq"
+    mnt, key, secret, user, pwd = "mnt", "xca7VJ6GeO55SkAy", "QVruRGfkfddnHk9C", "alex8224@126.com", "xtgdmjq"
     api = KuaipanAPI(mnt, key, secret, user, pwd)
     path, offset, length = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
     session = requests.Session()
-    result = api.download_file2(path, session, offset, length)
-    data =  "".join([data for data in api.download_file2(path, session, offset, length)])
-    print data
-    print len(data)
+    url = api.get_downloadurl(session, path)
+    print url
+    # data =  "".join([data for data in api.download_file2(url, session, offset, length)])
+    # print data
+    # print len(data)

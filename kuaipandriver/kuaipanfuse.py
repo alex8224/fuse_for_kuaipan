@@ -12,12 +12,14 @@
 # 1. add virtualdirectory support extend task, for example: document convert
 # 2. support many consumerkey and consumersecret to solve api day limit
 #********************************************************************************
+
 import os
 import sys
 import time
 import copy
 import signal
 import common
+from common import HTTPSession, CopyOnWriteBuffer
 from Queue import Queue
 from hashlib import sha1
 from functools import partial
@@ -394,9 +396,10 @@ class WalkAroundTreeTask(Future):
         Future.__init__(self)
         self.api = api
         self.path = path
+        self.session = HTTPSession()
 
     def readdir(self, path):
-        return self.api.metadata(path=path)
+        return self.api.metadata(path=path, session=self.session)
 
     def listdir(self, path, allfilesinfo):
         dirs = []
@@ -446,7 +449,9 @@ class WalkAroundTreeTask(Future):
                     if nodetype == "dir":
                         stack.append(path)
             except:
-                pass
+                import traceback;traceback.print_exc()
+
+            
         return allfilesinfo
 
     def __call__(self, *args):
@@ -597,44 +602,100 @@ class FuseTask(Future):
             # self.buffgen = self.api.download_file(self.path, self.bufsize)
             # self.waiter.set()
 
-class DownloadTask(object):
+class DownloadTask(Thread):
 
     def __init__(self, api, hashpath, path, filesize, notify):
+        Thread.__init__(self)
         self.api = api
         self.path = path
         self.stream = None
         self.filesize = filesize
-        from requests import Session
-        self.session = Session()
-        self.lock = Lock()
+        self.session = HTTPSession()
+        self.condition = Condition()
         self.downloadurl = ''
+        self.response = None
         self.initsession()
 
     def initsession(self):
-        self.downloadurl = self.api.get_downloadurl(self.session, self.path)
+        self.downloadurl = self.api.get_downloadurl(self.path)
         logger.debug("download url is %s" % self.downloadurl)
 
-    def wait_data(self, offset, size):
-        with self.lock:
-            logger.debug("filesize:%d, wait_data(%d, %d)" % (self.filesize, offset, size))
-            return "".join([data for data in self.api.download_file2(self.downloadurl, self.session, self.filesize, offset, (size -1 ))])
+    def read_data(self, offset, size):
+        with open(self.tmpfilename) as cachedfile:
+            cachedfile.seek(offset)
+            return cachedfile.read(size)
 
-    def close_stream(self):
-        with self.lock:
-            if self.stream:
-                self.stream.close()
+    def wait_data(self, offset, size):
+        while 1:
+            with self.condition:
+                cachefile = self.session.cachefile
+                cachefilesize = len(cachefile)
+                if offset + size < cachefilesize:
+                    cachefile.seek(offset)
+                    return cachefile.read(size)
+                elif cachefilesize == self.filesize:
+                    cachefile.seek(offset)
+                    return cachefile.read(size)
+                else:
+                    self.condition.wait()
+            
+    def end_download_file(self):
+        with self.condition:
+            logger.debug("file %s download completed" % (self.path, ))
+            self.notify()
+
+    def notify(self):
+        with self.condition:
+            self.condition.notify()
+
+    def resultcallback(self, status):
+        with self.condition:
+            logger.debug(status)
+            self.conidtion.notify()
+
+    def run(self):
+        logger.debug("start download %s" % self.path)
+        self.session.prepare(self.downloadurl, callback=self.notify)
+        self.api.download_file2(self.session)
+        print len(self.session.response.cachefile)
+
+class WriteTask(object):
+
+    def __init__(self, api, hashpath, path, filename, uploadqueue):
+        self.api = api
+        self.hashpath = hashpath
+        self.path = path
+        self.filename = filename
+        self.fullpath = CACHE_PATH + hashpath
+        self.writebytes = 0
+        self.filesize = 0
+        self.uploadqueue = uploadqueue
+        self.clsname = "_" + self.__class__.__name__
+
+
 
     def end_download_file(self):
-        with self.lock:
+        with self.condition:
             logger.debug("file %s download completed" % (self.path, ))
-            # self.close_stream()
-            del self.session
+            # os.unlink(self.tmpfilename)
+            self.notify()
 
-    def start(self):
-        with self.lock:
-            logger.debug("start download %s" % self.path)
-            # self.stream = self.api.download_file1(self.path)
+    def notify(self):
+        with self.condition:
+            self.condition.notify_all()
 
+    def resultcallback(self, status):
+        with self.condition:
+            logger.debug(status)
+            self.conidtion.notify()
+
+    def run(self):
+        logger.debug("start download %s" % self.path)
+        self.tmpfile = open(self.tmpfilename, "w") 
+        self.session = HTTPSession(tmpfile=self.tmpfile, callback=self.notify)
+        self.response = self.api.download_file2(self.downloadurl, self.session)
+        print len(self.response.text)
+        self.tmpfile.close()
 
 class WriteTask(object):
 
@@ -743,12 +804,10 @@ class KuaiPanFuse(LoggingMixIn, Operations):
                 raise FuseOSError(EIO)
             else:
                 raise
-
-
+            
     def init(self, path):
         logger.debug("fuse system already started!")
         self.initkuaipan()
-
 
     def setaccountinfo(self):
 
@@ -807,11 +866,12 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         hashpath = self.__hashpath(path, enablepid=True)
         downloadtask = self.taskpool.query_download_task(hashpath)
         if downloadtask:
-            # logger.debug("task already existed! pid:%d" % pid)
+            logger.debug("task already existed! pid:%d" % pid)
             return downloadtask.wait_data(offset, size)
         else:
             filesize = self.fileprops[path]["st_size"]
             downloadtask = self.taskpool.download_file(hashpath, self.api, path, filesize)
+            logger.debug("create download task")
             return downloadtask.wait_data(offset, size)
 
     def link(self, linktarget, linkname):
@@ -1014,7 +1074,7 @@ def main():
         if not islogin:
             return
         FUSE(
-                KuaiPanFuse(api), mntpoint, foreground=False, nothreads=False, 
+                KuaiPanFuse(api), mntpoint, foreground=True, nothreads=False, 
                 debug=False, big_writes=True, gid=os.getgid(), uid=os.getuid(), 
                 umask='0133'
             )
