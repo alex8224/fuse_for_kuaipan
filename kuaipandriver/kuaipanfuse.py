@@ -11,6 +11,7 @@
 # todo
 # 1. add virtualdirectory support extend task, for example: document convert
 # 2. support many consumerkey and consumersecret to solve api day limit
+# 3. test host speed and using fastest connection download file
 #********************************************************************************
 
 import os
@@ -628,16 +629,32 @@ class DownloadTask(Thread):
     def wait_data(self, offset, size):
         while 1:
             with self.condition:
+                if not self.session.response:
+                    logger.debug("HTTPResponse not ready, wait...")
+                    self.condition.wait(0.01)
+                    continue
+
+                status_code = self.session.response.status_code
+                # logger.debug("status_code=%d" % status_code)
+                if status_code == -1:
+                    self.condition.wait(0.01)
+                    continue
+                elif status_code != 200:
+                    raise OpenAPIException("http error")
+
                 cachefile = self.session.cachefile
                 cachefilesize = len(cachefile)
                 if offset + size < cachefilesize:
                     cachefile.seek(offset)
                     return cachefile.read(size)
                 elif cachefilesize == self.filesize:
-                    cachefile.seek(offset)
-                    return cachefile.read(size)
+                    if offset < cachefilesize:
+                        cachefile.seek(offset)
+                        return cachefile.read(size)
+                    else:
+                        return ''
                 else:
-                    self.condition.wait()
+                    self.condition.wait(0.01)
             
     def end_download_file(self):
         with self.condition:
@@ -656,8 +673,13 @@ class DownloadTask(Thread):
     def run(self):
         logger.debug("start download %s" % self.path)
         self.session.prepare(self.downloadurl, callback=self.notify)
-        self.api.download_file2(self.session)
-        print len(self.session.response.cachefile)
+        try:
+            self.api.download_file2(self.session)
+            print len(self.session.response.cachefile)
+        except OpenAPIError,apiex:
+            logger.debug('download file2 error.')
+            self.session.response.status_code = 500
+            self.notify()
 
 class WriteTask(object):
 
@@ -865,14 +887,17 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         uid, gid, pid = fuse_get_context()
         hashpath = self.__hashpath(path, enablepid=True)
         downloadtask = self.taskpool.query_download_task(hashpath)
-        if downloadtask:
-            logger.debug("task already existed! pid:%d" % pid)
+        try:
+            if downloadtask:
+                logger.debug("task already existed! pid:%d" % pid)
+                return downloadtask.wait_data(offset, size)
+            else:
+                filesize = self.fileprops[path]["st_size"]
+                downloadtask = self.taskpool.download_file(hashpath, self.api, path, filesize)
+                logger.debug("create download task")
             return downloadtask.wait_data(offset, size)
-        else:
-            filesize = self.fileprops[path]["st_size"]
-            downloadtask = self.taskpool.download_file(hashpath, self.api, path, filesize)
-            logger.debug("create download task")
-            return downloadtask.wait_data(offset, size)
+        except OpenAPIException, apiex:
+            raise FuseOSError(EIO)
 
     def link(self, linktarget, linkname):
         self.__waituploadready(linkname)

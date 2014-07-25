@@ -176,13 +176,17 @@ class CopyOnWriteBuffer(object):
 
     def seek(self, offset):
         if offset >= self.length:
+            print("======================offset:%d, self.length:%d" % (offset, self.length))
             raise Exception("paramter error")
 
         self.readindex = offset
 
     def clear(self):
         with self.lock:
-            self.buff = []
+            self.buff = ''
+            self.readindex = 0
+            self.buflist = []
+            self.length = 0
 
 
     def tell(self):
@@ -204,7 +208,7 @@ class Response(object):
         self.curl = curl
         from cStringIO import StringIO
         self.content = StringIO()
-        self.status_code = 200
+        self.status_code = -1
         self._cachefile = tmpfile
         self.writecallback = callback
 
@@ -280,6 +284,8 @@ class HTTPSession(object):
         self.cachefile = CopyOnWriteBuffer()
 
     def get(self, url, **kwargs):
+        self.curl.reset()
+        self.cachefile.clear()
         if self.cookiefile:
             self.response =  Response(self.curl, url, tmpfile=self.cachefile)
         else:
@@ -292,6 +298,8 @@ class HTTPSession(object):
         return self.response
 
     def start_get(self, **kwargs):
+        self.curl.reset()
+        self.cachefile.clear()
         return self.response.get(**kwargs)
 
     def close(self):

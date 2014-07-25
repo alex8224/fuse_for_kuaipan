@@ -194,18 +194,21 @@ class KuaipanAPI(object):
         session = HTTPSession() 
         result = session.get(sig_req_url, verbose=True)
         session.close()
-        print result.headers["Location"]
-        return result.headers["Location"]
+        downloadurl = result.headers["Location"]
+        print "before url %s" % downloadurl
+        # import re
+        # urlpatter = re.compile('^(http://)(p\d+)(.*)$')
+        # urlarray = urlpatter.split(downloadurl)[1:-1]
+        # urlarray[1] = 'p6'
+        # downloadurl = "".join(urlarray)
+        # print "after url %s" % downloadurl
+        return downloadurl
+        # return result.headers["Location"]
 
     @catchexception
     def download_file2(self, session):
-        # if offset >-1:
-            # endoffset = offset + length -1
-            # if endoffset > filesize:
-                # endoffset = filesize - 1
             # extra_header = [("Connection: Keep-Alive"), ("Range: bytes=%d-%d" % (offset, endoffset))]
             # print("got range %d-%d" % (offset, endoffset))
-
         return session.start_get()
         
     @catchexception
