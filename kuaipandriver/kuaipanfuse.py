@@ -20,7 +20,7 @@ import time
 import copy
 import signal
 import common
-from common import HTTPSession, CopyOnWriteBuffer
+from common import HTTPSession, CopyOnWriteBuffer, gethomedir
 from Queue import Queue
 from hashlib import sha1
 from functools import partial
@@ -331,7 +331,7 @@ class TaskPool(object):
         self.uploadpool[hashpath] = task
         return task
 
-    def query_upload_task1(self, key):
+    def query_upload_task(self, key):
         if key in self.uploadpool:
             return self.uploadpool[key]
 
@@ -635,7 +635,6 @@ class DownloadTask(Thread):
                     continue
 
                 status_code = self.session.response.status_code
-                # logger.debug("status_code=%d" % status_code)
                 if status_code == -1:
                     self.condition.wait(0.01)
                     continue
@@ -652,6 +651,7 @@ class DownloadTask(Thread):
                         cachefile.seek(offset)
                         return cachefile.read(size)
                     else:
+                        #why offfset > length?
                         return ''
                 else:
                     self.condition.wait(0.01)
@@ -1004,7 +1004,7 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         '''called by fuse try to write data to path'''
         hashpath = self.__hashpath(path)
         filename = os.path.basename(path)
-        writetask = self.taskpool.query_upload_task1(hashpath)
+        writetask = self.taskpool.query_upload_task(hashpath)
         if writetask:
             writetask.sendmesg("push_upload_file", (data, offset))
             self.fileprops[path]["st_size"] += len(data)
@@ -1027,7 +1027,7 @@ class KuaiPanFuse(LoggingMixIn, Operations):
     def release(self, path, fh):
         '''called by fuse release a file'''
         hashpath = self.__hashpath(path)
-        uploadtask = self.taskpool.query_upload_task1(hashpath)
+        uploadtask = self.taskpool.query_upload_task(hashpath)
         if uploadtask:
             uploadtask.sendmesg("end_upload_file", ())
             uploadtask.sendmesg("end_task", ())
@@ -1049,29 +1049,26 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         
     def loadtree(self):
         '''load directory tree from local disk'''
-        with self.rlock:
-            from pkg_resources import resource_filename
-            filename = resource_filename("kuaipandriver", "tree.db")
-            if os.path.exists(filename):
-                from pickle import load
-                return load(file(filename))
+        filename = gethomedir() + os.sep + "tree.db"
+        if os.path.exists(filename):
+            from pickle import load
+            return load(file(filename))
 
     def savetree(self):
         '''cache directory tree to local disk'''
-        with self.rlock:
-            from pkg_resources import resource_filename
-            filename = resource_filename("kuaipandriver", "tree.db")
-            if not self.fileprops:
-                pass
-            with open(filename, "w") as treefile:
-                from pickle import dump
-                dump(self.fileprops, treefile)
-                logger.debug("dump ok" + str(self.fileprops))
+        if not self.fileprops:
+            return
+
+        filename = gethomedir() + os.sep + "tree.db"
+        with open(filename, "w") as treefile:
+            from pickle import dump
+            dump(self.fileprops, treefile)
+            logger.debug("dump ok" + str(self.fileprops))
 
     def destroy(self, path):
         '''called by fuse destory context'''
-        logger.debug("fuse exited!")
         self.savetree()
+        logger.debug("fuse exited!")
 
 def main():
     from kuaipandriver.common import getauthinfo, checkplatform

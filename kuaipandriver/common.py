@@ -149,6 +149,9 @@ def checkplatform():
         sys.stderr.write("Kuaipandriver only support Linux Platform")
         sys.exit(1)
 
+def gethomedir():
+    return expanduser("~")
+
 class CopyOnWriteBuffer(object):
 
     '''实现一个CopyOnWrite 线程安全的缓冲区，读的缓冲区可以一直读，写的'''
@@ -175,10 +178,7 @@ class CopyOnWriteBuffer(object):
            self.buff = newbuff
 
     def seek(self, offset):
-        if offset >= self.length:
-            print("======================offset:%d, self.length:%d" % (offset, self.length))
-            raise Exception("paramter error")
-
+        assert offset < self.length, "offset cannot greater than length"
         self.readindex = offset
 
     def clear(self):
@@ -201,15 +201,13 @@ class CopyOnWriteBuffer(object):
 
 class Response(object):
 
-    def __init__(self, curl, url, cookiefile="cookies.txt", tmpfile=None, callback=None):
+    def __init__(self, curl, url, cookiefile="cookies.txt", cachefile=None, callback=None):
         self.headers = {}
         self.cookiefile = cookiefile
         self.url = url
         self.curl = curl
-        from cStringIO import StringIO
-        self.content = StringIO()
         self.status_code = -1
-        self._cachefile = tmpfile
+        self._cachefile = cachefile
         self.writecallback = callback
 
     def parseheader(self, header):
@@ -225,6 +223,10 @@ class Response(object):
 
     @property
     def cachefile(self):
+        return self._cachefile
+
+    @property
+    def raw(self):
         return self._cachefile
 
     @property
@@ -250,16 +252,44 @@ class Response(object):
         if self.writecallback:
             self.writecallback()
 
-        # self.content.write(chunk)
+    def _header2curlstyle(self, headers):
+        return  map(lambda h:(h[0] +": " + h[1]), headers.iteritems())
+    
+    def _dict2urlfields(self, payfields):
+        return "&".join(["%s=%s" % (item[0],item[1]) for item in payfields.iteritems()])
 
-    def get(self, verbose=False, nobody=False, extra_header=None):
+    def post(self, data=None, verbose=False, headers=None):
+        assert data != None, "data parameter not pass"
+        if isinstance(data, str):
+            #direct post str as body 
+            pass
+        elif isinstance(data, dict):
+            postfields = self._dict2urlfields(data)
+            self.curl.setopt(self.curl.POSTFIELDS, postfields)
+        self.curl.setopt(self.curl.VERBOSE, verbose)
+
+        if headers:
+            heade = self._header2curlstyle(headers)
+            print(heade)
+            self.curl.setopt(self.curl.HTTPHEADER, heade)
+
+        self.curl.setopt(self.curl.WRITEFUNCTION, self.contentfunc)
+        self.curl.setopt(self.curl.HEADERFUNCTION, self.headerfunc)
+        self.curl.setopt(self.curl.COOKIEFILE, self.cookiefile)
+        self.curl.setopt(self.curl.COOKIEJAR, self.cookiefile)
+        self.curl.setopt(self.curl.URL, self.url)
+        self.curl.perform()
+        return self
+
+    def get(self, verbose=False, nobody=False, headers=None):
         if verbose:
             self.curl.setopt(self.curl.VERBOSE, 1)
         if nobody:
             self.curl.setopt(self.curl.NOBODY, 1)
 
-        if extra_header:
-            self.curl.setopt(self.curl.HTTPHEADER, extra_header)
+        if headers:
+            curl_headers = self._header2curlstyle(headers)
+            self.curl.setopt(self.curl.HTTPHEADER, curl_headers)
         self.curl.setopt(self.curl.COOKIEJAR, self.cookiefile)
         self.curl.setopt(self.curl.COOKIEFILE, self.cookiefile)
         self.curl.setopt(self.curl.HEADERFUNCTION, self.headerfunc)
@@ -283,23 +313,38 @@ class HTTPSession(object):
         self.url = ''
         self.cachefile = CopyOnWriteBuffer()
 
-    def get(self, url, **kwargs):
+    def _resetsession(self):
         self.curl.reset()
         self.cachefile.clear()
+    
+    def _setcookiefile(self, url):
         if self.cookiefile:
-            self.response =  Response(self.curl, url, tmpfile=self.cachefile)
+           self.response =  Response(self.curl, url, cachefile=self.cachefile, cookiefile=self.cookiefile)
         else:
-            self.response = Response(self.curl, url, tmpfile=self.cachefile)
+           self.response = Response(self.curl, url, cachefile=self.cachefile)
+
+    def get(self, url, **kwargs):
+        self._resetsession()
+
+        if self.cookiefile:
+           self.response =  Response(self.curl, url, cachefile=self.cachefile, cookiefile=self.cookiefile)
+        else:
+           self.response = Response(self.curl, url, cachefile=self.cachefile)
+
         return self.response.get(**kwargs)
 
+    def post(self, url, **kwargs):
+        self._resetsession()
+        self._setcookiefile(url)
+        return self.response.post(**kwargs)
+
     def prepare(self, url, **kwargs):
-        self.response = Response(self.curl, url, tmpfile=self.cachefile, **kwargs)
+        self.response = Response(self.curl, url, cachefile=self.cachefile, **kwargs)
         self.url = url
         return self.response
 
     def start_get(self, **kwargs):
-        self.curl.reset()
-        self.cachefile.clear()
+        self._resetsession()
         return self.response.get(**kwargs)
 
     def close(self):
@@ -309,7 +354,7 @@ class HTTPSession(object):
 
 if __name__ == '__main__':
     session = HTTPSession()
-    response = session.get("http://www.163.com")
+    response = session.post("http://www.163.com", verbose=True, data={"name":"alex","sex":"male"})
     if response.status_code == 200:
         cachedfile = response.cachefile
         print cachedfile.read()

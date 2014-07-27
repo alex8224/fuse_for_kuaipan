@@ -58,6 +58,7 @@ class KuaipanAPI(object):
         self.consumer_secret = secret
         self.auth_user = user
         self.auth_pwd = pwd
+        self.session  = HTTPSession()
         self.login()
 
     def login(self):
@@ -71,7 +72,7 @@ class KuaipanAPI(object):
     def request_token(self, callback=None):
         sig_req_url = self.__get_sig_url("request_token_base_url",has_oauth_token=False)
         try:
-            result = requests.get(sig_req_url)
+            result = self.session.get(sig_req_url)
             msg = ''
             if result.status_code == 200:
                 msg = result.json()
@@ -95,18 +96,20 @@ class KuaipanAPI(object):
     def get_auth_code(self, url):
         try:
             ua = "Mozilla/5.0 (X11; Linux i686) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.153 Safari/537.36"
-            sess = requests.Session()
+            # sess = requests.Session()
+            sess = HTTPSession()
             referer = url
-            step1_request = sess.get(url)
+            step1_request = sess.get(url, verbose=True)
             htdoc = html.fromstring(step1_request.text)
             s, app_name, oauth_token = htdoc.xpath("//input[@type='hidden']")
             post_payload = {"username":self.auth_user, "userpwd":self.auth_pwd,"s":s.value, "app_name":app_name.value, "oauth_token":oauth_token.value}
             headers = {"User-Agent":ua,"Referer":referer, "Host":"www.kuaipan.cn"}
             posturl = "https://www.kuaipan.cn/api.php?ac=open&op=authorisecheck"
 
-            step2_request = sess.post(posturl, data=post_payload,headers=headers)
+            step2_request = sess.post(posturl, data=post_payload,headers=headers, verbose=True)
             htdoc = html.fromstring(step2_request.text)
             msg = htdoc.xpath("//strong")[0].text
+            print("=============="+msg)
             if not msg.isdigit():
                 raise RequestException(msg.encode("utf-8"))
             return msg
@@ -149,7 +152,7 @@ class KuaipanAPI(object):
             parameters["oauth_verifier"] = auth_code
             base_url = config.get_access_token_base_url()
             sig_req_url = self._sig_request_url(base_url, parameters)
-            req_accesstoken = requests.get(sig_req_url)
+            req_accesstoken = self.session.get(sig_req_url)
 
             if req_accesstoken.status_code != 200:
                 raise RequestException(req_accesstoken.json()["msg"])
@@ -168,7 +171,7 @@ class KuaipanAPI(object):
     @catchexception
     def account_info(self):
         sig_req_url = self.__get_sig_url("account_info")
-        return requests.get(sig_req_url)
+        return self.session.get(sig_req_url)
 
     @catchexception
     def metadata(self,root="app_folder", path="", session=None):
@@ -176,7 +179,7 @@ class KuaipanAPI(object):
         if session:
             return session.get(sig_req_url)
         else:
-            return requests.get(sig_req_url)
+            return self.session.get(sig_req_url)
 
     @catchexception
     def download_file1(self, filepath):
