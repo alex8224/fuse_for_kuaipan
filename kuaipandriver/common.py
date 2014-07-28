@@ -49,14 +49,9 @@ def __setlogger(logfile):
     logger.setLevel(logging.NOTSET)
     return logger
 
-# def logger():
-    # return __setlogger(__api_log)
-
-
 def to_timestamp(timestr):
     struct_time = time.strptime(timestr,"%Y-%m-%d %H:%M:%S")
     return int(time.mktime(struct_time))
-
 
 def to_string(a):
     if type(a) is bool:
@@ -270,7 +265,6 @@ class Response(object):
 
         if headers:
             heade = self._header2curlstyle(headers)
-            print(heade)
             self.curl.setopt(self.curl.HTTPHEADER, heade)
 
         self.curl.setopt(self.curl.WRITEFUNCTION, self.contentfunc)
@@ -325,12 +319,7 @@ class HTTPSession(object):
 
     def get(self, url, **kwargs):
         self._resetsession()
-
-        if self.cookiefile:
-           self.response =  Response(self.curl, url, cachefile=self.cachefile, cookiefile=self.cookiefile)
-        else:
-           self.response = Response(self.curl, url, cachefile=self.cachefile)
-
+        self._setcookiefile(url)
         return self.response.get(**kwargs)
 
     def post(self, url, **kwargs):
@@ -351,10 +340,166 @@ class HTTPSession(object):
         self.curl.close()
         del self.response
 
+class CacheableObject(object):
+    def __init__(self):
+        self._key= ''
+        self._value = ''
+        self._hitcount = 0
+
+    @property
+    def hitcount(self):
+       return self._hitcount
+
+    @hitcount.setter
+    def hitcount(self, count):
+        self._hitcount = count
+
+    @property
+    def key(self):
+        return self._key
+
+    @key.setter
+    def key(self, key):
+        self._key = key
+
+    @property
+    def value(self):
+        return self._value
+
+    @value.setter
+    def value(self, value):
+        self._value = value
+
+    def __str__(self):
+        return "[key=%s, hitcount=%d]" % (self._key, self._hitcount)
+
+
+class DiskCacheable(CacheableObject):
+
+    def __init__(self):
+        CacheableObject.__init__(self)
+        self.cachedir = "/tmp/"
+
+    @property
+    def value(self):
+        return file(self.cachedir + self.key)
+
+    @value.setter
+    def value(self, filedata):
+        with open(self.cachedir + self.key, "w") as cachefile:
+            cachefile.write(filedata)
+        print("save to %s" % (self.cachedir + self.key))    
+
+    def destroy(self):
+        try:
+            os.unlink(self.cachedir + self.key)
+            print("delet cachefile %s" % (self.cachedir + self.key))
+        except:
+            print("delete cachefile failed!")
+
+class LRUCache(object):
+    '''
+    {"key": {"ttl": seconds, "object": cacheableobj}
+    '''
+    def __init__(self, cap=100, db='lru.db'):
+        self.cap = cap
+        self.cache = {}
+        self.lruconfig = db
+
+    def set(self, key, value):
+        '''save object to cache'''
+        if len(self.cache) == self.cap:
+            needeliminate = self.findelimination()
+            if needeliminate:
+                key = needeliminate.key
+                needeliminate.destroy()
+                del self.cache[key]
+
+        self.cache[key] = {}
+        if key in self.cache:
+            self.cache[key]["hitcount"] = 0
+
+        self.cache[key]["ttl"] = 3600
+        self.cache[key]["object"] = value
+
+    def findelimination(self):
+        lastcacheobj = None
+        for cacheobj in self.cache.itervalues():
+            cacheobj = cacheobj["object"]
+            if lastcacheobj:
+                if cacheobj.hitcount < lastcacheobj.hitcount:
+                    lastcacheobj = cacheobj
+            else:
+                lastcacheobj = cacheobj
+
+        return lastcacheobj        
+
+    def remove(self, key):
+        if key in self.cache:
+            self.cache[key]["object"].destroy()
+            del self.cache[key]
+
+    def get(self, key):
+        if key in self.cache:
+            cacheobj = self.cache[key]["object"]
+            cacheobj.hitcount = cacheobj.hitcount+1
+            return cacheobj
+
+    @property
+    def count(self):
+        return len(self.cache)
+
+    def save(self):
+        import cPickle as pickle
+        pickle.dump(self.cache, open(self.lruconfig, "w"))
+
+    def load(self):
+        if os.path.exists(self.lruconfig):
+            import cPickle as pickle
+            self.cache = pickle.load(file(self.lruconfig))
+
+class SafeLRUCache(LRUCache):
+    
+    _instance_lock = RLock()
+
+    def __init__(self):
+        super(SafeLRUCache, self).__init__()
+        self.lock = RLock()
+
+    
+    @staticmethod
+    def instance():
+        '''create singleton ThreadPool object'''
+        if not hasattr(SafeLRUCache, "_instance"):
+            with SafeLRUCache._instance_lock:
+                if not hasattr(SafeLRUCache, "_instance"):
+                    SafeLRUCache._instance = SafeLRUCache()
+        return SafeLRUCache._instance
+
+    def set(self, key, value):
+        with self.lock:
+            super(SafeLRUCache, self).set(key, value)
+
+    def get(self, key):
+        with self.lock:
+            return super(SafeLRUCache, self).get(key)
+
+    @property
+    def count(self):
+        with self.lock:
+            return super(SafeLRUCache, self).count()
 
 if __name__ == '__main__':
-    session = HTTPSession()
-    response = session.post("http://www.163.com", verbose=True, data={"name":"alex","sex":"male"})
-    if response.status_code == 200:
-        cachedfile = response.cachefile
-        print cachedfile.read()
+
+   c = DiskCacheable()
+   c.key = "1"
+   c.value = "100" * 102400
+   c.hitcount = 1
+
+   cache = SafeLRUCache.instance()
+   cache.set(c.key, c)
+   print cache.get("1")
+   cache.remove("1")
+
+
+

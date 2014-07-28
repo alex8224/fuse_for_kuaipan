@@ -12,6 +12,9 @@
 # 1. add virtualdirectory support extend task, for example: document convert
 # 2. support many consumerkey and consumersecret to solve api day limit
 # 3. test host speed and using fastest connection download file
+# 4. cache recent access file to improve performance
+# 设置缓存对象的个数, 根据LRC算法，淘汰访问最少的文件，访问之前先从服务器的到该文件的最新信息
+# 4.1 如果该文件的hash与本地相同，则读取本地文件 4.2 如果不同，淘汰掉本地缓存，并从服务器下载该文件,更新本地缓存
 #********************************************************************************
 
 import os
@@ -20,7 +23,7 @@ import time
 import copy
 import signal
 import common
-from common import HTTPSession, CopyOnWriteBuffer, gethomedir
+from common import HTTPSession, gethomedir, SafeLRUCache, DiskCacheable
 from Queue import Queue
 from hashlib import sha1
 from functools import partial
@@ -491,6 +494,8 @@ class FuseTask(Future):
         return self.api.delete(path)
 
     def unlink(self, path):
+        hashpath = sha1(path.encode("utf-8")).hexdigest().strip()
+        SafeLRUCache.instance().remove(hashpath)
         return self.rmdir(path)
 
     def rename(self, oldpath, newpath):
@@ -608,25 +613,44 @@ class DownloadTask(Thread):
     def __init__(self, api, hashpath, path, filesize, notify):
         Thread.__init__(self)
         self.api = api
+        self.hashpath = hashpath
+        self.cachekey = hashpath[0:hashpath.find("_")]
         self.path = path
-        self.stream = None
         self.filesize = filesize
         self.session = HTTPSession()
         self.condition = Condition()
+        self.cache = SafeLRUCache.instance()
+        self.fromcache = False
         self.downloadurl = ''
         self.response = None
-        self.initsession()
 
     def initsession(self):
         self.downloadurl = self.api.get_downloadurl(self.path)
         logger.debug("download url is %s" % self.downloadurl)
 
-    def read_data(self, offset, size):
-        with open(self.tmpfilename) as cachedfile:
-            cachedfile.seek(offset)
-            return cachedfile.read(size)
+    def querycache(self):
+        cachefile = self.cache.get(self.cachekey)
+        if cachefile:
+            return cachefile.value
+  
+    def savetocache(self, data):
+        diskcachefile = DiskCacheable()
+        diskcachefile.key = self.cachekey
+        diskcachefile.value = data
+        self.cache.set(self.cachekey, diskcachefile)
+        logger.debug("save %s to cachefile" % self.hashpath)
 
-    def wait_data(self, offset, size):
+    def readfromcache(self, offset, size):
+        self.fromcache = True
+        cachefile = self.querycache()
+        if cachefile:
+            if offset > self.filesize:
+                return ''
+            cachefile.seek(offset)
+            return cachefile.read(size)
+
+    def readfromserver(self, offset, size):
+
         while 1:
             with self.condition:
                 if not self.session.response:
@@ -655,10 +679,19 @@ class DownloadTask(Thread):
                         return ''
                 else:
                     self.condition.wait(0.01)
-            
+
+    def wait_data(self, offset, size):
+        if self.cache.get(self.cachekey):
+            return self.readfromcache(offset, size)
+        else:
+            return self.readfromserver(offset, size)
+
     def end_download_file(self):
         with self.condition:
             logger.debug("file %s download completed" % (self.path, ))
+            if not self.fromcache:
+                self.session.cachefile.seek(0)
+                self.savetocache(self.session.cachefile.read())
             self.notify()
 
     def notify(self):
@@ -671,15 +704,19 @@ class DownloadTask(Thread):
             self.conidtion.notify()
 
     def run(self):
-        logger.debug("start download %s" % self.path)
-        self.session.prepare(self.downloadurl, callback=self.notify)
-        try:
-            self.api.download_file2(self.session)
-            print len(self.session.response.cachefile)
-        except OpenAPIError,apiex:
-            logger.debug('download file2 error.')
-            self.session.response.status_code = 500
-            self.notify()
+        if not self.cache.get(self.cachekey):
+            logger.debug("start download %s" % self.path)
+            self.initsession()
+            self.session.prepare(self.downloadurl, callback=self.notify)
+            try:
+                self.api.download_file2(self.session)
+                print len(self.session.response.cachefile)
+            except OpenAPIError,apiex:
+                logger.debug('download file2 error.')
+                self.session.response.status_code = 500
+                self.notify()
+        else:
+            logger.debug("download file from cache")
 
 class WriteTask(object):
 
@@ -830,6 +867,10 @@ class KuaiPanFuse(LoggingMixIn, Operations):
     def init(self, path):
         logger.debug("fuse system already started!")
         self.initkuaipan()
+        self.initcache()
+
+    def initcache(self):
+        SafeLRUCache.instance().load()
 
     def setaccountinfo(self):
 
@@ -889,12 +930,10 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         downloadtask = self.taskpool.query_download_task(hashpath)
         try:
             if downloadtask:
-                logger.debug("task already existed! pid:%d" % pid)
                 return downloadtask.wait_data(offset, size)
             else:
                 filesize = self.fileprops[path]["st_size"]
                 downloadtask = self.taskpool.download_file(hashpath, self.api, path, filesize)
-                logger.debug("create download task")
             return downloadtask.wait_data(offset, size)
         except OpenAPIException, apiex:
             raise FuseOSError(EIO)
@@ -1068,6 +1107,7 @@ class KuaiPanFuse(LoggingMixIn, Operations):
     def destroy(self, path):
         '''called by fuse destory context'''
         self.savetree()
+        SafeLRUCache.instance().save()
         logger.debug("fuse exited!")
 
 def main():

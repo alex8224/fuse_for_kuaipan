@@ -109,7 +109,6 @@ class KuaipanAPI(object):
             step2_request = sess.post(posturl, data=post_payload,headers=headers, verbose=True)
             htdoc = html.fromstring(step2_request.text)
             msg = htdoc.xpath("//strong")[0].text
-            print("=============="+msg)
             if not msg.isdigit():
                 raise RequestException(msg.encode("utf-8"))
             return msg
