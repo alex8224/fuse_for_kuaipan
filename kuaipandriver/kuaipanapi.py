@@ -178,7 +178,7 @@ class KuaipanAPI(object):
         if session:
             return session.get(sig_req_url)
         else:
-            return self.session.get(sig_req_url)
+            return requests.get(sig_req_url)
 
     @catchexception
     def download_file1(self, filepath):

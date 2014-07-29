@@ -334,10 +334,6 @@ class TaskPool(object):
         self.uploadpool[hashpath] = task
         return task
 
-    def query_upload_task(self, key):
-        if key in self.uploadpool:
-            return self.uploadpool[key]
-
     def delete_upload_task(self, key):
         if key in self.uploadpool:
             del self.uploadpool[key]
@@ -505,109 +501,6 @@ class FuseTask(Future):
         return self.api.account_info()
 
 
-# class DownloadTask(Thread):
-    # def __init__(self, api, hashpath, path, bufsize, notify):
-        # Thread.__init__(self)
-        # self.api = api
-        # self.path = path
-        # self.hashpath = hashpath
-        # self.condi = Condition()
-        # self.downloadbytes = 0
-        # self.finished = False
-        # import tempfile
-        # self.tmpfilename = tempfile.mktemp()
-        # self.continueread = True
-        # self.setDaemon(True)
-
-    # def wait_data(self, size, offset):
-        # while self.continueread:
-            # with self.condi:
-                # if offset < self.downloadbytes:
-                    # with open(self.tmpfilename) as ronlyfile:
-                        # ronlyfile.seek(offset)
-                        # return ronlyfile.read(size)
-                # elif self.finished:
-                    # break
-                # else:
-                    # self.condi.wait(5)
-                    # logger.debug("%d:%d:%d:%s" % (offset, size, self.downloadbytes, self.tmpfilename))
-
-    # def end_download_file(self):
-        # with self.condi:
-            # self.continueread = False
-            # self.condi.notify_all()
-            # logger.debug("clean cache %s" % self.tmpfilename)
-            # if os.path.exists(self.tmpfilename):
-                # os.unlink(self.tmpfilename)
-
-    # def run(self):
-        # self.stream = self.api.download_file1(self.path)
-        # with open(self.tmpfilename, "w") as tempfile:
-            # while 1:
-                # data = self.stream.read(8192)
-                # if not data:
-                    # break
-                # tempfile.write(data)
-                # tempfile.flush()
-                # with self.condi:
-                    # self.downloadbytes += len(data)
-                    # self.condi.notify_all()
-        # self.stream.close()
-        # with self.condi: 
-            # self.finished = True
-            # self.condi.notify_all()
-        # logger.debug("%s download ok, hashpath:%s" % (self.path, self.hashpath))
-
-# class DownloadTask(Thread, Future):
-
-    # def __init__(self, api, hashpath, path, bufsize, notify):
-        # Thread.__init__(self)
-        # Future.__init__(self)
-        # self.api = api
-        # self.path = path
-        # self.hashpath = hashpath
-        # from threading import Event
-        # self.waiter = Event()
-        # self.isfirst = True
-        # self.bufsize = bufsize
-        # self.notify = notify
-        # self.downloadbytes = 0
-        # self.lock = Lock()
-        # self.waitobj = Condition(self.lock)
-
-    # def wait_data(self, size):
-        # self.waiter.wait()
-        # with self.lock:
-            # if self.isfirst:
-                # self.buffgen.send(None)
-                # firstdata = self.buffgen.send(self.bufsize)
-                # self.downloadbytes += len(firstdata)
-                # self.isfirst = False
-                # return firstdata
-            # else:
-                # try:
-                    # data = self.buffgen.send(size)
-                    # self.downloadbytes += len(data)
-                    # return data
-                # except StopIteration:
-                    # logger.error("gen stoped============================")
-                    # self.buffgen.close()
-                # except Exception, e:
-                    # import traceback
-                    # traceback.print_exc()
-
-    # def end_download_file(self):
-        # logger.debug("file %s download completed, %d bytes downloaded, key %s" % (self.path, self.downloadbytes, self.hashpath))
-        # with self.lock:
-            # self.notify()
-            # self.buffgen.close()
-
-    # def run(self):
-        # logger.debug("start download %s" % self.path)
-        # with self.lock:
-            # self.buffgen = self.api.download_file(self.path, self.bufsize)
-            # self.waiter.set()
-
 class DownloadTask(Thread):
 
     def __init__(self, api, hashpath, path, filesize, notify):
@@ -623,16 +516,40 @@ class DownloadTask(Thread):
         self.fromcache = False
         self.downloadurl = ''
         self.response = None
+        self.cachevalue = self.querycache()
 
     def initsession(self):
         self.downloadurl = self.api.get_downloadurl(self.path)
         logger.debug("download url is %s" % self.downloadurl)
 
+    def hash1equal(self):
+        try:
+            metainfo = self.api.metadata(path=self.path)
+            logger.debug(metainfo.json())
+            if metainfo.status_code == 200:
+                metainfo = metainfo.json()
+                localcachefile = "/tmp/" + self.cachekey 
+                from hashlib import sha1
+                localhash = sha1(file(localcachefile).read()).hexdigest().strip()
+                return localhash == metainfo["sha1"]
+            else:
+                return False
+        except (IOError, OpenAPIException) as ex:
+            logger.error(ex)
+            return False
+
     def querycache(self):
-        cachefile = self.cache.get(self.cachekey)
-        if cachefile:
-            return cachefile.value
-  
+        if self.hash1equal():
+            cachefile = self.cache.get(self.cachekey)
+            if cachefile:
+                try:
+                    value = cachefile.value
+                    self.fromcache = True
+                    return value
+                except IOError, ioe:
+                    logger.error(ioe)
+                    self.cache.remove(self.cachekey)
+
     def savetocache(self, data):
         diskcachefile = DiskCacheable()
         diskcachefile.key = self.cachekey
@@ -641,13 +558,13 @@ class DownloadTask(Thread):
         logger.debug("save %s to cachefile" % self.hashpath)
 
     def readfromcache(self, offset, size):
-        self.fromcache = True
-        cachefile = self.querycache()
-        if cachefile:
-            if offset > self.filesize:
-                return ''
-            cachefile.seek(offset)
-            return cachefile.read(size)
+        with self.condition:
+            cachefile = self.cachevalue
+            if cachefile:
+                if offset > self.filesize:
+                    return ''
+                cachefile.seek(offset)
+                return cachefile.read(size)
 
     def readfromserver(self, offset, size):
 
@@ -655,7 +572,7 @@ class DownloadTask(Thread):
             with self.condition:
                 if not self.session.response:
                     logger.debug("HTTPResponse not ready, wait...")
-                    self.condition.wait(0.01)
+                    self.condition.wait(1)
                     continue
 
                 status_code = self.session.response.status_code
@@ -681,30 +598,26 @@ class DownloadTask(Thread):
                     self.condition.wait(0.01)
 
     def wait_data(self, offset, size):
-        if self.cache.get(self.cachekey):
+        if self.fromcache:
             return self.readfromcache(offset, size)
         else:
             return self.readfromserver(offset, size)
 
     def end_download_file(self):
         with self.condition:
-            logger.debug("file %s download completed" % (self.path, ))
+            logger.debug("file %s download completed" % self.path)
             if not self.fromcache:
                 self.session.cachefile.seek(0)
                 self.savetocache(self.session.cachefile.read())
             self.notify()
+            self.session.close()
 
     def notify(self):
         with self.condition:
             self.condition.notify()
 
-    def resultcallback(self, status):
-        with self.condition:
-            logger.debug(status)
-            self.conidtion.notify()
-
     def run(self):
-        if not self.cache.get(self.cachekey):
+        if not self.fromcache:
             logger.debug("start download %s" % self.path)
             self.initsession()
             self.session.prepare(self.downloadurl, callback=self.notify)
@@ -718,43 +631,6 @@ class DownloadTask(Thread):
         else:
             logger.debug("download file from cache")
 
-class WriteTask(object):
-
-    def __init__(self, api, hashpath, path, filename, uploadqueue):
-        self.api = api
-        self.hashpath = hashpath
-        self.path = path
-        self.filename = filename
-        self.fullpath = CACHE_PATH + hashpath
-        self.writebytes = 0
-        self.filesize = 0
-        self.uploadqueue = uploadqueue
-        self.clsname = "_" + self.__class__.__name__
-
-
-
-    def end_download_file(self):
-        with self.condition:
-            logger.debug("file %s download completed" % (self.path, ))
-            # os.unlink(self.tmpfilename)
-            self.notify()
-
-    def notify(self):
-        with self.condition:
-            self.condition.notify_all()
-
-    def resultcallback(self, status):
-        with self.condition:
-            logger.debug(status)
-            self.conidtion.notify()
-
-    def run(self):
-        logger.debug("start download %s" % self.path)
-        self.tmpfile = open(self.tmpfilename, "w") 
-        self.session = HTTPSession(tmpfile=self.tmpfile, callback=self.notify)
-        self.response = self.api.download_file2(self.downloadurl, self.session)
-        print len(self.response.text)
-        self.tmpfile.close()
 
 class WriteTask(object):
 
