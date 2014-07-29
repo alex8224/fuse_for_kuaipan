@@ -8,19 +8,61 @@
 #****************************************************
 
 import os
-from os.path import expanduser
 import hmac
 import time
+import pycurl
 import base64
 import urllib
-import logging
 import hashlib
-import logging.handlers
-from pycurl import Curl
-from threading import RLock
+import traceback
 from copy import copy
+from threading import RLock
+from os.path import expanduser
 
-__api_log = "kuaipanapi.log"
+from ConfigParser import ConfigParser
+from pkg_resources import resource_filename
+
+defaultNode = 'DEFAULT'
+configName = resource_filename("kuaipandriver", "config.ini")
+
+
+def getlogger():
+    import logging
+    from logging import handlers
+    logger = logging.getLogger("kuaipanserver")
+    hdlr = logging.StreamHandler()
+    fdlr = handlers.TimedRotatingFileHandler("kuaipan_fuse.log", 'D', backupCount=30)
+    format = logging.Formatter("%(asctime)s %(filename)s[line:%(lineno)d] %(levelname)s - %(message)s", "%Y-%m-%d %H:%M:%S")
+    logger.addHandler(hdlr)
+    logger.addHandler(fdlr)
+    hdlr.setFormatter(format)
+    fdlr.setFormatter(format)
+    logger.setLevel(logging.DEBUG)
+    return logger
+
+
+class _Method:
+    def __init__(self, configobj, name):
+        self.configobj = configobj
+        self.name = name
+
+    def __call__(self, *args):
+        name = self.name[4:]
+        return str(self.configobj[name])
+
+class Config(object):
+    def __init__(self):
+        try:
+            cf = ConfigParser()
+            cf.read(configName)
+            self.configobj = dict(cf.items(defaultNode))
+        except Exception:
+            print(" read config error: %s" % traceback.format_exc())
+
+    def __getattr__(self, name):
+        return _Method(self.configobj, name)
+
+config = Config()
 
 def AtomCounter():
 
@@ -39,15 +81,6 @@ def oauth_once_next():
 
     return getnext
 
-
-def __setlogger(logfile):
-    logger = logging.getLogger()
-    rh = logging.handlers.TimedRotatingFileHandler(logfile, 'D', backupCount=30)
-    fm = logging.Formatter("%(asctime)s %(filename)s[line:%(lineno)d] %(levelname)s - %(message)s", "%Y-%m-%d %H:%M:%S")
-    rh.setFormatter(fm)
-    logger.addHandler(rh)
-    logger.setLevel(logging.NOTSET)
-    return logger
 
 def to_timestamp(timestr):
     struct_time = time.strptime(timestr,"%Y-%m-%d %H:%M:%S")
@@ -149,13 +182,13 @@ def gethomedir():
 
 class CopyOnWriteBuffer(object):
 
-    '''实现一个CopyOnWrite 线程安全的缓冲区，读的缓冲区可以一直读，写的'''
+
     def __init__(self):
         self.buff = ''
         self.buflist = []
         self.lock = RLock()
         self.readindex = 0
-        self.length = 0
+        self._length = 0
 
     def read(self, n=-1):
         if n == -1:
@@ -166,7 +199,7 @@ class CopyOnWriteBuffer(object):
     def write(self, chunk):
         with self.lock:
            self.buflist.append(chunk)
-           self.length += len(chunk)
+           self._length += len(chunk)
            newbuff = copy(self.buff)
            newbuff += "".join(self.buflist)
            self.buflist = []
@@ -183,38 +216,34 @@ class CopyOnWriteBuffer(object):
             self.buflist = []
             self.length = 0
 
+    @property
+    def length(self):
+        with self.lock:
+            return self._length
 
     def tell(self):
         return self.readindex
 
-    def __len__(self):
-        return self.length
 
-    def __del__(self):
-        if self.buff:
-            del self.buff
+class response(object):
 
-class Response(object):
-
-    def __init__(self, curl, url, cookiefile="cookies.txt", cachefile=None, callback=None):
+    def __init__(self):
         self.headers = {}
-        self.cookiefile = cookiefile
-        self.url = url
-        self.curl = curl
-        self.status_code = -1
-        self._cachefile = cachefile
-        self.writecallback = callback
-
-    def parseheader(self, header):
-        header = header.strip()
-        firstsep = header.find(":")
-        if firstsep>-1:
-            headername = header[0:firstsep]
-            headervalue = header[firstsep+2:]
-            self.headers[headername] = headervalue
+        self._status_code = -1
+        self._cachefile = CopyOnWriteBuffer()
+        self._headers = {}
+        self._body = None
 
     def __str__(self):
         return "[Response %d]" % self.status_code
+
+    @property
+    def status_code(self):
+        return self._status_code
+
+    @status_code.setter
+    def status_code(self, status_code):
+        self._status_code = status_code
 
     @property
     def cachefile(self):
@@ -224,6 +253,10 @@ class Response(object):
     def raw(self):
         return self._cachefile
 
+    @raw.setter
+    def raw(self, cachefile):
+        self._cachefile = cachefile
+ 
     @property
     def text(self):
         return self._cachefile.read()
@@ -232,9 +265,33 @@ class Response(object):
         import json
         return json.loads(self._cachefile.read()) 
 
+
+class httprequest(object):
+    def __init__(self, curl=None, cookiefile=None, callback=None, cachefile=None):
+        self.curl = curl if curl else pycurl.Curl()
+        self.cookiefile = cookiefile if cookiefile else ''
+        self.response = response()
+        self.writecallback = callback
+        self.cachefile = cachefile
+
+    def _header2curlstyle(self, headers):
+        return map(lambda h:(h[0] +": " + h[1]), headers.iteritems())
+    
+    def _dict2urlfields(self, payfields):
+        return "&".join(["%s=%s" % (item[0],item[1]) for item in payfields.iteritems()])
+
     def parserstatus(self, statusline):
         s1 = statusline.find(" ")
-        schema, self.status_code = statusline[0:s1], int(statusline[s1+1:s1+4])
+        schema, self.response.status_code = statusline[0:s1], int(statusline[s1+1:s1+4])
+
+    def parseheader(self, header):
+        header = header.strip()
+        firstsep = header.find(":")
+        if firstsep>-1:
+            headername = header[0:firstsep]
+            headervalue = header[firstsep+2:]
+            self.response.headers[headername] = headervalue
+
 
     def headerfunc(self, header):
         if header.startswith("HTTP"):
@@ -243,102 +300,102 @@ class Response(object):
            self.parseheader(header) 
 
     def contentfunc(self, chunk):
-        self._cachefile.write(chunk)
-        if self.writecallback:
+        if self.cachefile:
+            self.cachefile.write(chunk)
             self.writecallback()
+        else:
+            self.response.cachefile.write(chunk)
 
-    def _header2curlstyle(self, headers):
-        return  map(lambda h:(h[0] +": " + h[1]), headers.iteritems())
-    
-    def _dict2urlfields(self, payfields):
-        return "&".join(["%s=%s" % (item[0],item[1]) for item in payfields.iteritems()])
+    def setopt(self, url=None, verbose=False, nobody=False, headers=None, timeout=120, data=None):
+        assert url, "url not passed"
+        self.curl.setopt(pycurl.URL, url)
 
-    def post(self, data=None, verbose=False, headers=None):
-        assert data != None, "data parameter not pass"
-        if isinstance(data, str):
-            #direct post str as body 
-            pass
-        elif isinstance(data, dict):
-            postfields = self._dict2urlfields(data)
-            self.curl.setopt(self.curl.POSTFIELDS, postfields)
-        self.curl.setopt(self.curl.VERBOSE, verbose)
-
-        if headers:
-            heade = self._header2curlstyle(headers)
-            self.curl.setopt(self.curl.HTTPHEADER, heade)
-
-        self.curl.setopt(self.curl.WRITEFUNCTION, self.contentfunc)
-        self.curl.setopt(self.curl.HEADERFUNCTION, self.headerfunc)
-        self.curl.setopt(self.curl.COOKIEFILE, self.cookiefile)
-        self.curl.setopt(self.curl.COOKIEJAR, self.cookiefile)
-        self.curl.setopt(self.curl.URL, self.url)
-        self.curl.perform()
-        return self
-
-    def get(self, verbose=False, nobody=False, headers=None):
         if verbose:
-            self.curl.setopt(self.curl.VERBOSE, 1)
+                self.curl.setopt(pycurl.VERBOSE, 1)
         if nobody:
-            self.curl.setopt(self.curl.NOBODY, 1)
+                self.curl.setopt(pycurl.NOBODY, 1)
 
         if headers:
             curl_headers = self._header2curlstyle(headers)
-            self.curl.setopt(self.curl.HTTPHEADER, curl_headers)
-        self.curl.setopt(self.curl.COOKIEJAR, self.cookiefile)
-        self.curl.setopt(self.curl.COOKIEFILE, self.cookiefile)
-        self.curl.setopt(self.curl.HEADERFUNCTION, self.headerfunc)
-        self.curl.setopt(self.curl.WRITEFUNCTION, self.contentfunc)
+            self.curl.setopt(pycurl.HTTPHEADER, curl_headers)
 
-        # if process:
-            # self.curl.setopt(self.curl.NOPROGRESS, 0)
-            # self.curl.setopt(self.curl.PROGRESSFUNCTION, process)
+        if data:
+            if isinstance(data, str):
+                #direct post str as body 
+                pass
+            elif isinstance(data, dict):
+                postfields = self._dict2urlfields(data)
+                self.curl.setopt(pycurl.POSTFIELDS, postfields)
 
-        self.curl.setopt(self.curl.URL, self.url)
+        self.curl.setopt(pycurl.TIMEOUT, timeout)
+        if self.cookiefile:
+            self.curl.setopt(pycurl.COOKIEJAR, self.cookiefile)
+            self.curl.setopt(pycurl.COOKIEFILE, self.cookiefile)
+        self.curl.setopt(pycurl.HEADERFUNCTION, self.headerfunc)
+        self.curl.setopt(pycurl.WRITEFUNCTION, self.contentfunc)
+
+    def post(self, url, **kwargs):
+        data = kwargs["data"]
+        assert data, "post must have data field"
+        assert url, "url must passed!"
+        kwargs.update(dict(url=url))
+        self.setopt(**kwargs)
         self.curl.perform()
-        return self
+        return self.response
+
+    def close(self):
+        self.curl.close()
+
+    def get(self, url, **kwargs):
+        assert url, "url must passed!"
+        kwargs.update(dict(url=url))
+        self.setopt(**kwargs)
+        self.curl.perform()
+        return self.response
+
 
 class HTTPSession(object):
 
     def __init__(self, cookiefile="cookies.txt", **kwargs):
-        self.curl = Curl()
+        self.curl = pycurl.Curl()
         self.cookiefile = cookiefile
         self.kwargs = kwargs
         self.response = None
         self.url = ''
-        self.cachefile = CopyOnWriteBuffer()
 
     def _resetsession(self):
         self.curl.reset()
-        self.cachefile.clear()
     
-    def _setcookiefile(self, url):
-        if self.cookiefile:
-           self.response =  Response(self.curl, url, cachefile=self.cachefile, cookiefile=self.cookiefile)
-        else:
-           self.response = Response(self.curl, url, cachefile=self.cachefile)
-
-    def get(self, url, **kwargs):
+    def get(self, url, callback=None, cachefile=None, **kwargs):
         self._resetsession()
-        self._setcookiefile(url)
-        return self.response.get(**kwargs)
+        if callback and cachefile:
+            return httprequest(curl=self.curl, cookiefile=self.cookiefile, callback=callback, cachefile=cachefile).get(url, **kwargs)
+        else:
+            return httprequest(curl=self.curl, cookiefile=self.cookiefile).get(url, **kwargs)
+
 
     def post(self, url, **kwargs):
         self._resetsession()
-        self._setcookiefile(url)
-        return self.response.post(**kwargs)
+        return httprequest(curl=self.curl, cookiefile=self.cookiefile).post(url, **kwargs)
 
-    def prepare(self, url, **kwargs):
-        self.response = Response(self.curl, url, cachefile=self.cachefile, **kwargs)
-        self.url = url
+    def prepare(self, **kwargs):
+        self.response = response(self.curl, **kwargs)
         return self.response
 
-    def start_get(self, **kwargs):
+    def start_get(self, url, **kwargs):
         self._resetsession()
-        return self.response.get(**kwargs)
+        return self.response.get(url, **kwargs)
 
     def close(self):
         self.curl.close()
         del self.response
+
+def httpget(url, **kwargs):
+    return httprequest().get(url, **kwargs)
+
+def httppost(url, **kwargs):
+    return httprequest().post(url, **kwargs)
+
 
 class CacheableObject(object):
     def __init__(self):
@@ -378,7 +435,7 @@ class DiskCacheable(CacheableObject):
 
     def __init__(self):
         CacheableObject.__init__(self)
-        self.cachedir = "/tmp/"
+        self.cachedir = config.get_cache_object_dir()
 
     @property
     def value(self):
@@ -401,10 +458,10 @@ class LRUCache(object):
     '''
     {"key": {"ttl": seconds, "object": cacheableobj}
     '''
-    def __init__(self, cap=100, db='lru.db'):
-        self.cap = cap
+    def __init__(self):
+        self.cap = config.get_cache_object_number()
         self.cache = {}
-        self.lruconfig = db
+        self.lruconfig = expanduser("~") + os.sep + ".lru.db"
 
     def set(self, key, value):
         '''save object to cache'''
@@ -412,8 +469,7 @@ class LRUCache(object):
             needeliminate = self.findelimination()
             if needeliminate:
                 key = needeliminate.key
-                needeliminate.destroy()
-                del self.cache[key]
+                self.remove(key)
 
         self.cache[key] = {}
         if key in self.cache:
@@ -469,7 +525,6 @@ class SafeLRUCache(LRUCache):
     
     @staticmethod
     def instance():
-        '''create singleton ThreadPool object'''
         if not hasattr(SafeLRUCache, "_instance"):
             with SafeLRUCache._instance_lock:
                 if not hasattr(SafeLRUCache, "_instance"):
@@ -490,16 +545,10 @@ class SafeLRUCache(LRUCache):
             return super(SafeLRUCache, self).count()
 
 if __name__ == '__main__':
+    def notify():
+        print("got write event")
 
-   c = DiskCacheable()
-   c.key = "1"
-   c.value = "100" * 102400
-   c.hitcount = 1
-
-   cache = SafeLRUCache.instance()
-   cache.set(c.key, c)
-   print cache.get("1")
-   cache.remove("1")
-
-
-
+    buff = CopyOnWriteBuffer()
+    session = HTTPSession()
+    session.get("http://www.v2ex.com", callback=notify, cachefile=buff)
+    print buff.read()

@@ -16,14 +16,10 @@ import common
 import requests
 from functools import wraps
 import lxml.html as html
-from kuaipandriver.config import Config
-from kuaipandriver.common import oauth_once_next, HTTPSession
+from kuaipandriver.common import oauth_once_next, HTTPSession, httpget, config
 from requests.exceptions import RequestException
 
 next_oauth_once = oauth_once_next()
-
-config = Config()
-# logger = getLogger()
 
 def handler(signum, frame):
     print "use press ctrl+c exit"
@@ -58,7 +54,6 @@ class KuaipanAPI(object):
         self.consumer_secret = secret
         self.auth_user = user
         self.auth_pwd = pwd
-        self.session  = HTTPSession()
         self.login()
 
     def login(self):
@@ -72,7 +67,8 @@ class KuaipanAPI(object):
     def request_token(self, callback=None):
         sig_req_url = self.__get_sig_url("request_token_base_url",has_oauth_token=False)
         try:
-            result = self.session.get(sig_req_url)
+            # result = self.session.get(sig_req_url)
+            result = httpget(sig_req_url)
             msg = ''
             if result.status_code == 200:
                 msg = result.json()
@@ -151,7 +147,8 @@ class KuaipanAPI(object):
             parameters["oauth_verifier"] = auth_code
             base_url = config.get_access_token_base_url()
             sig_req_url = self._sig_request_url(base_url, parameters)
-            req_accesstoken = self.session.get(sig_req_url)
+            # req_accesstoken = self.session.get(sig_req_url)
+            req_accesstoken = httpget(sig_req_url)
 
             if req_accesstoken.status_code != 200:
                 raise RequestException(req_accesstoken.json()["msg"])
@@ -170,7 +167,7 @@ class KuaipanAPI(object):
     @catchexception
     def account_info(self):
         sig_req_url = self.__get_sig_url("account_info")
-        return self.session.get(sig_req_url)
+        return httpget(sig_req_url)
 
     @catchexception
     def metadata(self,root="app_folder", path="", session=None):
@@ -178,7 +175,7 @@ class KuaipanAPI(object):
         if session:
             return session.get(sig_req_url)
         else:
-            return requests.get(sig_req_url)
+            return httpget(sig_req_url)
 
     @catchexception
     def download_file1(self, filepath):
@@ -190,12 +187,10 @@ class KuaipanAPI(object):
         except RequestException, e:
             raise OpenAPIError(e) 
 
-    def get_downloadurl(self, filepath):
+    def get_downloadurl(self, filepath, session):
         attach = {"path":filepath, "root":"app_folder"}
         sig_req_url = self.__get_sig_url("download", attachdata=attach)
-        session = HTTPSession() 
         result = session.get(sig_req_url, verbose=True)
-        session.close()
         downloadurl = result.headers["Location"]
         print "before url %s" % downloadurl
         # import re
@@ -208,10 +203,8 @@ class KuaipanAPI(object):
         # return result.headers["Location"]
 
     @catchexception
-    def download_file2(self, session):
-            # extra_header = [("Connection: Keep-Alive"), ("Range: bytes=%d-%d" % (offset, endoffset))]
-            # print("got range %d-%d" % (offset, endoffset))
-        return session.start_get()
+    def download_file2(self, url, callback, cachefile, session):
+        return session.get(url, callback=callback, cachefile=cachefile)
         
     @catchexception
     def download_file(self, filepath, bufsize=0):
@@ -249,11 +242,11 @@ class KuaipanAPI(object):
     def create_folder(self, folder,dir=""):
         attach = {"root":"app_folder", "path":folder}
         sig_req_url = self.__get_sig_url("create_folder", attachdata=attach)
-        return requests.get(sig_req_url)
+        return httpget(sig_req_url)
 
     def get_upload_locate(self, ):
         locate_url = self.__get_sig_url("upload_locate")
-        resp = requests.get(locate_url)
+        resp = httpget(locate_url)
         return resp, resp.json()
 
 
@@ -298,27 +291,27 @@ class KuaipanAPI(object):
     def delete(self, filename):
         attach = {"root":"app_folder","path":filename}
         sig_req_url = self.__get_sig_url("delete", attachdata=attach)
-        return requests.get(sig_req_url)
+        return httpget(sig_req_url)
 
     @catchexception
     def copy(self, frompath, topath):
         attach = {"root":"app_folder", "from_path":frompath, "to_path":topath}
         sig_req_url = self.__get_sig_url("copy", attachdata=attach)
-        copy_result = requests.get(sig_req_url)
+        copy_result = httpget(sig_req_url)
         return copy_result.json() if copy_result.status_code == 200 else copy_result
 
     @catchexception
     def move(self, frompath, topath):
         attach = {"root":"app_folder","from_path":frompath, "to_path":topath}
         sig_req_url = self.__get_sig_url("move", attachdata=attach)
-        return requests.get(sig_req_url)
+        return httpget(sig_req_url)
 
     @catchexception
     def convert(self, path, viewtype):
         doctype = path[-3:]
         attach = {"type":doctype, "view":viewtype, "root":"app_folder", "path":path, "zip":1}
         sig_req_url = self.__get_sig_url("convert", attachdata=attach)
-        return requests.get(sig_req_url, stream=True)
+        return httpget(sig_req_url, stream=True)
 
 
     def _oauth_parameter(self, has_token=True):

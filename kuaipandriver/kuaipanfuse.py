@@ -22,8 +22,9 @@ import sys
 import time
 import copy
 import signal
+import pycurl
 import common
-from common import HTTPSession, gethomedir, SafeLRUCache, DiskCacheable
+from common import HTTPSession, gethomedir, SafeLRUCache, DiskCacheable, CopyOnWriteBuffer, config, getlogger
 from Queue import Queue
 from hashlib import sha1
 from functools import partial
@@ -34,6 +35,7 @@ from threading import Thread, Condition, RLock as Lock
 from errno import ENOENT, EROFS, EEXIST, EIO
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn, fuse_get_context
 
+logger = getlogger()
 TYPE_DIR = (S_IFDIR | 0644 )
 TYPE_FILE = (S_IFREG | 0644 )
 BLOCK_SIZE = 4096
@@ -52,21 +54,7 @@ ROOT_ST_INFO = {
         "st_name": "/"
         }
 
-import logging
-def getlogger():
-    logger = logging.getLogger("kuaipanserver")
-    hdlr = logging.StreamHandler()
-    fdlr = logging.handlers.TimedRotatingFileHandler("kuaipan_fuse.log", 'D', backupCount=30)
-    format = logging.Formatter("%(asctime)s %(filename)s[line:%(lineno)d] %(levelname)s - %(message)s", "%Y-%m-%d %H:%M:%S")
-    logger.addHandler(hdlr)
-    logger.addHandler(fdlr)
-    hdlr.setFormatter(format)
-    fdlr.setFormatter(format)
-    logger.setLevel(logging.DEBUG)
-    return logger
 
-
-logger = getlogger()
 
 def handler(signum, frame):
     print "use press ctrl+c exit"
@@ -111,11 +99,9 @@ class ThreadPool(Thread):
 
     def __init__(self):
         Thread.__init__(self)
-        from config import Config
-        configobj = Config()
-        self.max_thread_num = int(configobj.get_max_thread_num())
-        self.free_thread_num = int(configobj.get_free_thread_num())
-        self.idle_seconds = int(configobj.get_idle_seconds())
+        self.max_thread_num = int(config.get_max_thread_num())
+        self.free_thread_num = int(config.get_free_thread_num())
+        self.idle_seconds = int(config.get_idle_seconds())
         self.runflag = False
         self.freequeue = deque()
         self.busyqueue = deque()
@@ -510,33 +496,29 @@ class DownloadTask(Thread):
         self.cachekey = hashpath[0:hashpath.find("_")]
         self.path = path
         self.filesize = filesize
-        self.session = HTTPSession()
         self.condition = Condition()
         self.cache = SafeLRUCache.instance()
+        self.cachefile = CopyOnWriteBuffer()
         self.fromcache = False
-        self.downloadurl = ''
-        self.response = None
         self.cachevalue = self.querycache()
-
-    def initsession(self):
-        self.downloadurl = self.api.get_downloadurl(self.path)
-        logger.debug("download url is %s" % self.downloadurl)
+        self.success = True
 
     def hash1equal(self):
-        try:
-            metainfo = self.api.metadata(path=self.path)
-            logger.debug(metainfo.json())
-            if metainfo.status_code == 200:
-                metainfo = metainfo.json()
-                localcachefile = "/tmp/" + self.cachekey 
-                from hashlib import sha1
-                localhash = sha1(file(localcachefile).read()).hexdigest().strip()
-                return localhash == metainfo["sha1"]
-            else:
-                return False
-        except (IOError, OpenAPIException) as ex:
-            logger.error(ex)
-            return False
+        return True
+        # try:
+            # metainfo = self.api.metadata(path=self.path)
+            # logger.debug(metainfo.json())
+            # if metainfo.status_code == 200:
+                # metainfo = metainfo.json()
+                # localcachefile = "/tmp/" + self.cachekey 
+                # from hashlib import sha1
+                # localhash = sha1(file(localcachefile).read()).hexdigest().strip()
+                # return localhash == metainfo["sha1"]
+            # else:
+                # return False
+        # except (IOError, OpenAPIException) as ex:
+            # logger.error(ex)
+            # return False
 
     def querycache(self):
         if self.hash1equal():
@@ -570,32 +552,21 @@ class DownloadTask(Thread):
 
         while 1:
             with self.condition:
-                if not self.session.response:
-                    logger.debug("HTTPResponse not ready, wait...")
-                    self.condition.wait(1)
-                    continue
-
-                status_code = self.session.response.status_code
-                if status_code == -1:
-                    self.condition.wait(0.01)
-                    continue
-                elif status_code != 200:
-                    raise OpenAPIException("http error")
-
-                cachefile = self.session.cachefile
-                cachefilesize = len(cachefile)
+                if not self.success:
+                    return ''
+                cachefilesize = self.cachefile.length
                 if offset + size < cachefilesize:
-                    cachefile.seek(offset)
-                    return cachefile.read(size)
+                    self.cachefile.seek(offset)
+                    return self.cachefile.read(size)
                 elif cachefilesize == self.filesize:
                     if offset < cachefilesize:
-                        cachefile.seek(offset)
-                        return cachefile.read(size)
+                        self.cachefile.seek(offset)
+                        return self.cachefile.read(size)
                     else:
                         #why offfset > length?
                         return ''
                 else:
-                    self.condition.wait(0.01)
+                    self.condition.wait(1)
 
     def wait_data(self, offset, size):
         if self.fromcache:
@@ -606,11 +577,10 @@ class DownloadTask(Thread):
     def end_download_file(self):
         with self.condition:
             logger.debug("file %s download completed" % self.path)
-            if not self.fromcache:
-                self.session.cachefile.seek(0)
-                self.savetocache(self.session.cachefile.read())
+            if not self.fromcache and self.success:
+                self.cachefile.seek(0)
+                self.savetocache(self.cachefile.read())
             self.notify()
-            self.session.close()
 
     def notify(self):
         with self.condition:
@@ -619,14 +589,17 @@ class DownloadTask(Thread):
     def run(self):
         if not self.fromcache:
             logger.debug("start download %s" % self.path)
-            self.initsession()
-            self.session.prepare(self.downloadurl, callback=self.notify)
             try:
-                self.api.download_file2(self.session)
-                print len(self.session.response.cachefile)
-            except OpenAPIError,apiex:
+                session = HTTPSession()
+                downloadurl = self.api.get_downloadurl(self.path, session)
+                self.api.download_file2(downloadurl, self.notify, self.cachefile, session)
+            except OpenAPIError:
                 logger.debug('download file2 error.')
-                self.session.response.status_code = 500
+                self.success = False
+                self.notify()
+            except pycurl.error as pyerror:
+                logger.debug("download file error, reason is %s" % pyerror[1])
+                self.success = False
                 self.notify()
         else:
             logger.debug("download file from cache")
