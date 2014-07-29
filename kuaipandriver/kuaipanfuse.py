@@ -588,7 +588,7 @@ class DownloadTask(Thread):
             try:
                 session = HTTPSession()
                 urlresult = self.api.get_downloadurl(self.path, session)
-                if urlresult !=200:
+                if urlresult.status_code != 302:
                     raise OpenAPIException("get_download_url failed %s" % urlresult.text)
                 downloadurl = urlresult.headers["Location"]
                 self.api.download_file2(downloadurl, self.notify, self.cachefile, session)

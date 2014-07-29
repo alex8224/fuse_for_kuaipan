@@ -50,11 +50,11 @@ class KuaipanAPI(object):
     SIG_METHOD = "HMAC-SHA1"
 
     APILIST = (
-                ("xca7VJ6GeO55SkAy", "QVruRGfkfddnHk9C"), 
                 ("xchAnjnCdbjAmDVG", "xIb1iRVWEusFasLk"), 
                 ("xcpSzCqMAAMAXVX0", "Ghx1HeZNT6KCaFyt"), 
                 ("xcLZ52biN0IfmIj7", "xKRhasdyj11VmjDT"), 
-                ("xclSX19bD5JW86NZ", "QALDvUVZ8NvTYHbD") 
+                ("xclSX19bD5JW86NZ", "QALDvUVZ8NvTYHbD"),
+                ("xca7VJ6GeO55SkAy", "QVruRGfkfddnHk9C") 
             )
 
 
@@ -93,14 +93,15 @@ class KuaipanAPI(object):
             try:
                 while 1:
                     result = func(*args, **kwargs)
-                    if result.status_code == 200:
-                        return result
-                    elif result.status_code == 401 and result.json()["msg"] == "api daily limit":
+                    if result.status_code == 401 and result.json()["msg"] == "api daily limit":
                         this.login()
+                    else:
+                        return result
             except:
                 raise
         return wrapper                
 
+    @retrylogin
     def request_token(self, callback=None):
         sig_req_url = self.__get_sig_url("request_token_base_url", has_oauth_token=False)
         try:
@@ -114,8 +115,7 @@ class KuaipanAPI(object):
                         setattr(self, common.to_string(k), common.safe_value(v))
             elif result.status_code == 500:
                 raise RequestException("kuaipan internal server error!")
-            else:
-                raise RequestException(result.json()["msg"])
+            return result
         except RequestException as reqex:
             errmsg = "get init token failed!, err message is:%s" % str(reqex)
             print(errmsg)
