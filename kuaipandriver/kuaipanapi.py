@@ -43,20 +43,43 @@ def catchexception(func):
             raise OpenAPIError(exception, tracebackinfo)
     return catch    
 
+
 class KuaipanAPI(object):
 
     VERSION = "1.0"
     SIG_METHOD = "HMAC-SHA1"
 
+    APILIST = (
+                ("xca7VJ6GeO55SkAy", "QVruRGfkfddnHk9C"), 
+                ("xchAnjnCdbjAmDVG", "xIb1iRVWEusFasLk"), 
+                ("xcpSzCqMAAMAXVX0", "Ghx1HeZNT6KCaFyt"), 
+                ("xcLZ52biN0IfmIj7", "xKRhasdyj11VmjDT"), 
+                ("xclSX19bD5JW86NZ", "QALDvUVZ8NvTYHbD") 
+            )
+
+
     def __init__(self, mntpoint, key, secret, user, pwd):
         self.mntpoint = mntpoint
-        self.consumer_key = key
-        self.consumer_secret = secret
+        self.consumer_key = ''
+        self.consumer_secret = ''
         self.auth_user = user
         self.auth_pwd = pwd
+        self.keylist = self.getapikey()
         self.login()
 
+    def getapikey(self):
+        
+        for key, secret in KuaipanAPI.APILIST:
+            yield key, secret 
+
+
     def login(self):
+        try:
+           self.consumer_key, self.consumer_secret =  self.keylist.next()
+           print("got next key and secret from api pool (%s, %s)" % (self.consumer_key, self.consumer_secret))
+        except StopIteration:
+            raise OpenAPIException("no more api secret and key can be used!")
+
         self.request_token()
         authorize_url = self.authorize()
         auth_code = self.get_auth_code(authorize_url)
@@ -64,10 +87,25 @@ class KuaipanAPI(object):
         from kuaipandriver.common import savelogin
         savelogin(self.mntpoint, self.consumer_key, self.consumer_secret, self.auth_user, self.auth_pwd)
 
+    def retrylogin(func):
+
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            this = args[0]
+            try:
+                while 1:
+                    result = func(*args, **kwargs)
+                    if result.status_code == 200:
+                        return result
+                    elif result.status_code == 401 and result.json()["msg"] == "api daily limit":
+                        this.login()
+            except:
+                raise
+        return wrapper                
+
     def request_token(self, callback=None):
-        sig_req_url = self.__get_sig_url("request_token_base_url",has_oauth_token=False)
+        sig_req_url = self.__get_sig_url("request_token_base_url", has_oauth_token=False)
         try:
-            # result = self.session.get(sig_req_url)
             result = httpget(sig_req_url)
             msg = ''
             if result.status_code == 200:
@@ -92,7 +130,6 @@ class KuaipanAPI(object):
     def get_auth_code(self, url):
         try:
             ua = "Mozilla/5.0 (X11; Linux i686) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.153 Safari/537.36"
-            # sess = requests.Session()
             sess = HTTPSession()
             referer = url
             step1_request = sess.get(url, verbose=True)
@@ -147,7 +184,6 @@ class KuaipanAPI(object):
             parameters["oauth_verifier"] = auth_code
             base_url = config.get_access_token_base_url()
             sig_req_url = self._sig_request_url(base_url, parameters)
-            # req_accesstoken = self.session.get(sig_req_url)
             req_accesstoken = httpget(sig_req_url)
 
             if req_accesstoken.status_code != 200:
@@ -165,11 +201,13 @@ class KuaipanAPI(object):
 
 
     @catchexception
+    @retrylogin
     def account_info(self):
         sig_req_url = self.__get_sig_url("account_info")
         return httpget(sig_req_url)
 
     @catchexception
+    @retrylogin
     def metadata(self,root="app_folder", path="", session=None):
         sig_req_url = self.__get_sig_url("metadata", urlsuffix=(root, urllib.quote(path.encode("utf-8"))))
         if session:
@@ -178,81 +216,47 @@ class KuaipanAPI(object):
             return httpget(sig_req_url)
 
     @catchexception
-    def download_file1(self, filepath):
-        attach = {"path":filepath, "root":"app_folder"}
-        sig_req_url = self.__get_sig_url("download", attachdata=attach)
-        try:
-            req_download = requests.get(sig_req_url,stream=True)
-            return req_download.raw
-        except RequestException, e:
-            raise OpenAPIError(e) 
-
+    @retrylogin
     def get_downloadurl(self, filepath, session):
         attach = {"path":filepath, "root":"app_folder"}
         sig_req_url = self.__get_sig_url("download", attachdata=attach)
-        result = session.get(sig_req_url, verbose=True)
-        downloadurl = result.headers["Location"]
-        print "before url %s" % downloadurl
+        return session.get(sig_req_url, verbose=True)
+        # downloadurl = result.headers["Location"]
+        # print "before url %s" % downloadurl
         # import re
         # urlpatter = re.compile('^(http://)(p\d+)(.*)$')
         # urlarray = urlpatter.split(downloadurl)[1:-1]
         # urlarray[1] = 'p6'
         # downloadurl = "".join(urlarray)
         # print "after url %s" % downloadurl
-        return downloadurl
+        # return downloadurl
         # return result.headers["Location"]
 
     @catchexception
+    @retrylogin
     def download_file2(self, url, callback, cachefile, session):
         return session.get(url, callback=callback, cachefile=cachefile)
-        
-    @catchexception
-    def download_file(self, filepath, bufsize=0):
-        attach = {"path":filepath, "root":"app_folder"}
-        sig_req_url = self.__get_sig_url("download", attachdata=attach)
-        print sig_req_url
-        try:
-            req_download = requests.get(sig_req_url,stream=True)
-            print req_download.headers
-            fd = req_download.raw
-            count = 0
-            bufsize = bufsize
-            isfirst = True
-            yield
-            while 1:
-                if isfirst:
-                    buff = fd.read(bufsize)
-                    if not buff:
-                        break
-                    bufsize = (yield buff)
-                    isfirst= False
-                else:
-                    buff = fd.read(bufsize)
-                    if not buff:
-                        break
-                    bufsize = (yield buff)
-                count += len(buff)
-        except Exception, e:
-            import traceback
-            traceback.print_exc()
-            raise OpenAPIError(e)
-
 
     @catchexception
+    @retrylogin
     def create_folder(self, folder,dir=""):
         attach = {"root":"app_folder", "path":folder}
         sig_req_url = self.__get_sig_url("create_folder", attachdata=attach)
         return httpget(sig_req_url)
 
+    @catchexception
+    @retrylogin
     def get_upload_locate(self, ):
         locate_url = self.__get_sig_url("upload_locate")
-        resp = httpget(locate_url)
-        return resp, resp.json()
-
+        return httpget(locate_url)
 
     @catchexception
     def upload(self, uploadpath, fullpath, filename):
-        result, upload_url = self.get_upload_locate()
+        result = self.get_upload_locate()
+        if result.status_code != 200:
+            raise OpenAPIException(result.text)
+
+        upload_url = result.json()
         upload_filename = uploadpath + "/" + filename
         attach = {"overwrite":"True","root":"app_folder","path":upload_filename}
         upload_url = self.__get_sig_url("upload",urlsuffix=(upload_url["url"],), attachdata=attach, httpmethod="post")
@@ -288,25 +292,28 @@ class KuaipanAPI(object):
 
 
     @catchexception
+    @retrylogin
     def delete(self, filename):
         attach = {"root":"app_folder","path":filename}
         sig_req_url = self.__get_sig_url("delete", attachdata=attach)
         return httpget(sig_req_url)
 
     @catchexception
+    @retrylogin
     def copy(self, frompath, topath):
         attach = {"root":"app_folder", "from_path":frompath, "to_path":topath}
         sig_req_url = self.__get_sig_url("copy", attachdata=attach)
-        copy_result = httpget(sig_req_url)
-        return copy_result.json() if copy_result.status_code == 200 else copy_result
+        return httpget(sig_req_url)
 
     @catchexception
+    @retrylogin
     def move(self, frompath, topath):
         attach = {"root":"app_folder","from_path":frompath, "to_path":topath}
         sig_req_url = self.__get_sig_url("move", attachdata=attach)
         return httpget(sig_req_url)
 
     @catchexception
+    @retrylogin
     def convert(self, path, viewtype):
         doctype = path[-3:]
         attach = {"type":doctype, "view":viewtype, "root":"app_folder", "path":path, "zip":1}
@@ -339,24 +346,27 @@ class KuaipanAPI(object):
 
 
 def test_api_limit():
-    k,s,u,p = "", "", "",""
+    import sys
+    k,s,u,p = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
     api = KuaipanAPI("mnt", k,s,u,p)
     import sys
     stdout = sys.stdout
-    for x in range(100000):
+    session = HTTPSession()
+    count = 0
+    while 1:
         try:
-            result = api.metadata(path="/")
+            result = api.metadata(path="/", session=session)
             if result.status_code != 200:
                 print result.text
                 break
             else:
-                print result.json()
-            stdout.write("api call count: %d\r" % (x+1))
+                count += 1
+            stdout.write("api call count: %d\r" % (count + 1))
             stdout.flush()
         except:
             break
 
-    print "api limit is: %d" % x
+    print "api limit is: %d" % count
 
 def test_doc_convert():
     mnt, key, secret, user, pwd = "mnt", "", "", "", ""

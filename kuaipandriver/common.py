@@ -22,9 +22,6 @@ from os.path import expanduser
 from ConfigParser import ConfigParser
 from pkg_resources import resource_filename
 
-defaultNode = 'DEFAULT'
-configName = resource_filename("kuaipandriver", "config.ini")
-
 
 def getlogger():
     import logging
@@ -53,6 +50,8 @@ class _Method:
 class Config(object):
     def __init__(self):
         try:
+            defaultNode = 'DEFAULT'
+            configName = resource_filename("kuaipandriver", "config.ini")
             cf = ConfigParser()
             cf.read(configName)
             self.configobj = dict(cf.items(defaultNode))

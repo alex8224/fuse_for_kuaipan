@@ -587,10 +587,13 @@ class DownloadTask(Thread):
             logger.debug("start download %s" % self.path)
             try:
                 session = HTTPSession()
-                downloadurl = self.api.get_downloadurl(self.path, session)
+                urlresult = self.api.get_downloadurl(self.path, session)
+                if urlresult !=200:
+                    raise OpenAPIException("get_download_url failed %s" % urlresult.text)
+                downloadurl = urlresult.headers["Location"]
                 self.api.download_file2(downloadurl, self.notify, self.cachefile, session)
-            except OpenAPIError:
-                logger.debug('download file2 error.')
+            except (OpenAPIError, OpenAPIException) as openex:
+                logger.debug(openex)
                 self.success = False
                 self.notify()
             except pycurl.error as pyerror:
