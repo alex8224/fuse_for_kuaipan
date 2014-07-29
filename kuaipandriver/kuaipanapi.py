@@ -4,7 +4,7 @@
 #Author: tony - birdaccp@gmail.com alex8224@gmail.com
 #Create by: 2013-08-17 10:33
 #Last modified:2014-07-02 15:01:35
-#Filename: kuaipan.py
+#Filename: kuaipanapi.py
 #Description:
 #****************************************************
 
@@ -68,10 +68,8 @@ class KuaipanAPI(object):
         self.login()
 
     def getapikey(self):
-        
         for key, secret in KuaipanAPI.APILIST:
             yield key, secret 
-
 
     def login(self):
         try:
