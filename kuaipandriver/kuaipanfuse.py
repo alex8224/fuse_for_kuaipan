@@ -23,8 +23,7 @@ import time
 import copy
 import signal
 import pycurl
-import common
-from common import HTTPSession, gethomedir, SafeLRUCache, DiskCacheable, CopyOnWriteBuffer, config, getlogger
+from common import *
 from Queue import Queue
 from hashlib import sha1
 from functools import partial
@@ -43,12 +42,12 @@ BLOCK_SIZE = 4096
 CACHE_PATH = "/dev/shm/"
 
 ROOT_ST_INFO = {
-        "st_mtime": common.timestamp(),
+        "st_mtime": timestamp(),
         "st_mode":  TYPE_DIR,
         "st_size":  4096,
         "st_gid":   os.getgid(),
         "st_uid":   os.getuid(),
-        "st_atime": common.timestamp(),
+        "st_atime": timestamp(),
         "st_nlink": 2,
         "st_parent_dir":".",
         "st_name": "/"
@@ -398,12 +397,12 @@ class WalkAroundTreeTask(Future):
             fullpath = os.path.join(path, finfo["name"])
 
             st_info = {
-                        "st_mtime": common.to_timestamp(finfo["modify_time"]),
+                        "st_mtime": to_timestamp(finfo["modify_time"]),
                         "st_mode":  TYPE_FILE if finfo["type"] == "file" else TYPE_DIR,
                         "st_size":  int(finfo["size"]) if finfo["type"] == "file" else 4096,
                         "st_gid":   os.getgid(),
                         "st_uid":   os.getuid(),
-                        "st_atime": common.timestamp(),
+                        "st_atime": timestamp(),
                         "st_parent_dir": path,
                         "st_name": finfo["name"]
                     }
