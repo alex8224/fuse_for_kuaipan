@@ -12,9 +12,6 @@
 # 1. add virtualdirectory support extend task, for example: document convert
 # 2. support many consumerkey and consumersecret to solve api day limit
 # 3. test host speed and using fastest connection download file
-# 4. cache recent access file to improve performance
-# 设置缓存对象的个数, 根据LRC算法，淘汰访问最少的文件，访问之前先从服务器的到该文件的最新信息
-# 4.1 如果该文件的hash与本地相同，则读取本地文件 4.2 如果不同，淘汰掉本地缓存，并从服务器下载该文件,更新本地缓存
 #********************************************************************************
 
 import os
