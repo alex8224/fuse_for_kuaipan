@@ -181,7 +181,6 @@ def gethomedir():
 
 class CopyOnWriteBuffer(object):
 
-
     def __init__(self):
         self.buff = ''
         self.buflist = []
@@ -196,12 +195,12 @@ class CopyOnWriteBuffer(object):
             return self.buff[self.readindex:self.readindex+n]
 
     def write(self, chunk):
-        with self.lock:
-           self.buflist.append(chunk)
-           self._length += len(chunk)
-           newbuff = copy(self.buff)
-           newbuff += "".join(self.buflist)
-           self.buflist = []
+       self.buflist.append(chunk)
+       self._length += len(chunk)
+       newbuff = copy(self.buff)
+       newbuff += "".join(self.buflist)
+       self.buflist = []
+       with self.lock:
            self.buff = newbuff
 
     def seek(self, offset):
@@ -305,7 +304,7 @@ class httprequest(object):
         else:
             self.response.cachefile.write(chunk)
 
-    def setopt(self, url=None, verbose=False, nobody=False, headers=None, timeout=120, data=None):
+    def setopt(self, url=None, verbose=False, nobody=False, headers=None, timeout=120, data=None, allow_redirect=False):
         assert url, "url not passed"
         self.curl.setopt(pycurl.URL, url)
 
@@ -333,6 +332,9 @@ class httprequest(object):
         self.curl.setopt(pycurl.HEADERFUNCTION, self.headerfunc)
         self.curl.setopt(pycurl.WRITEFUNCTION, self.contentfunc)
 
+        if allow_redirect:
+            self.curl.setopt(pycurl.FOLLOWLOCATION, 1)
+
     def post(self, url, **kwargs):
         data = kwargs["data"]
         assert data, "post must have data field"
@@ -355,12 +357,9 @@ class httprequest(object):
 
 class HTTPSession(object):
 
-    def __init__(self, cookiefile="cookies.txt", **kwargs):
+    def __init__(self, cookiefile="cookies.txt"):
         self.curl = pycurl.Curl()
         self.cookiefile = cookiefile
-        self.kwargs = kwargs
-        self.response = None
-        self.url = ''
 
     def _resetsession(self):
         self.curl.reset()
@@ -372,22 +371,12 @@ class HTTPSession(object):
         else:
             return httprequest(curl=self.curl, cookiefile=self.cookiefile).get(url, **kwargs)
 
-
     def post(self, url, **kwargs):
         self._resetsession()
         return httprequest(curl=self.curl, cookiefile=self.cookiefile).post(url, **kwargs)
 
-    def prepare(self, **kwargs):
-        self.response = response(self.curl, **kwargs)
-        return self.response
-
-    def start_get(self, url, **kwargs):
-        self._resetsession()
-        return self.response.get(url, **kwargs)
-
     def close(self):
         self.curl.close()
-        del self.response
 
 def httpget(url, **kwargs):
     return httprequest().get(url, **kwargs)
@@ -444,12 +433,10 @@ class DiskCacheable(CacheableObject):
     def value(self, filedata):
         with open(self.cachedir + self.key, "w") as cachefile:
             cachefile.write(filedata)
-        print("save to %s" % (self.cachedir + self.key))    
 
     def destroy(self):
         try:
             os.unlink(self.cachedir + self.key)
-            print("delet cachefile %s" % (self.cachedir + self.key))
         except:
             print("delete cachefile failed!")
 

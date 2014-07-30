@@ -292,7 +292,7 @@ class KuaipanAPI(object):
     @catchexception
     @retrylogin
     def delete(self, filename):
-        attach = {"root":"app_folder","path":filename}
+        attach = {"root":"app_folder","path":filename, "to_recycle":False}
         sig_req_url = self.__get_sig_url("delete", attachdata=attach)
         return httpget(sig_req_url)
 
@@ -316,8 +316,13 @@ class KuaipanAPI(object):
         doctype = path[-3:]
         attach = {"type":doctype, "view":viewtype, "root":"app_folder", "path":path, "zip":1}
         sig_req_url = self.__get_sig_url("convert", attachdata=attach)
-        return httpget(sig_req_url, stream=True)
-
+        session = HTTPSession(cookiefile="convertcookie.txt")
+        convertreq = session.get(sig_req_url)
+        if convertreq.status_code == 302:
+            converturl = convertreq.headers["Location"]
+            return session.get(converturl)
+        else:
+            return convertreq
 
     def _oauth_parameter(self, has_token=True):
         parameters = {

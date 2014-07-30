@@ -6,11 +6,13 @@
 #Create by: 2013-08-17 12:53
 #Last modified: 2014-07-01
 #Filename: kuanpanfuse.py
-#Description: 实现快盘的ＡＰＩ,可以实现文件的异步上传, 下载，浏览，目录操作
+#Description: 
+# 实现快盘的ＡＰＩ,可以实现文件的异步上传, 下载，浏览，目录, 文档转换操作
+# 支持配置本地读缓存，支持异步写
+# 支持查看网盘容量
+# 支持文档转换，以虚拟打印机的方式实现
 # 缩略图和版本功能未实现
 # todo
-# 1. add virtualdirectory support extend task, for example: document convert
-# 2. support many consumerkey and consumersecret to solve api day limit
 # 3. test host speed and using fastest connection download file
 #********************************************************************************
 
@@ -261,7 +263,6 @@ class Worker(Thread, Future):
         while 1:
             methodname, args = self.interactivequeue.get()
             if methodname == "end_task":
-                logger.debug("interactive terminated")
                 self.status = "FREE"
                 self.lastupdate = time.time()
                 ThreadPool.instance().taskdone(self)
@@ -272,15 +273,19 @@ class Worker(Thread, Future):
             else:
                 logger.error("no such method %s" % methodname)
 
+    def set_task_result(self, task, result):
+        if hasattr(task, "set_result"):
+            task.set_result(result)
+
     def runascallable(self, task, *args, **kwargs):
         try:
            self.status = "RUNNING"
            result = task(*args, **kwargs)
-           task.set_result(result)
+           self.set_task_result(task, result)
            self.status = "FREE"
            self.lastupdate = time.time()
         except Exception, taskex:
-           task.set_result(result)
+           set_task_result(task, result)
            self.status = "FREE"
            logger.error(taskex)
         finally:
@@ -309,10 +314,10 @@ class TaskPool(object):
         self.uploadlock, self.downlock = Lock(), Lock()
         self.taskclass = {"upload":WriteTask, "download":DownloadTask}
 
-    def upload_file(self, hashpath, *args):
+    def upload_file(self, hashpath, *args, **kwargs):
         params = list(args)
         params.insert(1, hashpath)
-        task = ThreadPool.instance().submit(WriteTask(*params))
+        task = ThreadPool.instance().submit(WriteTask(*params, **kwargs))
         self.uploadpool[hashpath] = task
         return task
 
@@ -606,7 +611,7 @@ class DownloadTask(Thread):
 
 class WriteTask(object):
 
-    def __init__(self, api, hashpath, path, filename, uploadqueue):
+    def __init__(self, api, hashpath, path, filename, uploadqueue, handler=None):
         self.api = api
         self.hashpath = hashpath
         self.path = path
@@ -616,6 +621,7 @@ class WriteTask(object):
         self.filesize = 0
         self.uploadqueue = uploadqueue
         self.clsname = "_" + self.__class__.__name__
+        self.afteruploadhandler = handler 
 
 
     def start_upload_file(self, data, offset):
@@ -633,7 +639,6 @@ class WriteTask(object):
                 f.seek(offset)
                 f.write(data)
 
-
     def end_upload_file(self):
         def upload_file():
             try:
@@ -642,6 +647,7 @@ class WriteTask(object):
                 uploadpath = os.path.dirname(self.path)
                 uploadresult = self.api.upload(uploadpath, self.fullpath, self.filename)
                 if uploadresult:
+                    self.afteruploadhandler(self.api)
                     logger.debug("file %s upload ok" % self.filename)
                     return True
                 else:
@@ -672,6 +678,43 @@ class WriteTask(object):
             logger.error(e)
 
 
+class AfterUploadHandler(object):
+    def __init__(self, api, path, fuse):
+        self.api = api
+        self.path = path
+        self.outputdir = config.get_file_convert_out_dir()
+        self.virtualdir = config.get_virtual_convert_dir()
+        self.threadpool = ThreadPool.instance()
+        self.fuse = fuse
+
+    def async_convert(self, api, viewtype):
+        fullpath = os.path.join(self.outputdir, os.path.basename(self.path)) + ".zip"
+        result = api.convert(self.path, viewtype)
+        if result.status_code == 200:
+            with open(fullpath, "w") as zipfile:
+                zipfile.write(result.raw.read())
+
+            logger.debug("%s convert ok" % fullpath)
+            self.fuse.unlink(self.path)
+        else:
+            logger.debug("convert document failed, the reason is %s" % result.text)
+
+    def __call__(self, *args):
+        dirname = os.path.dirname(self.path)
+        if dirname != self.virtualdir:
+            return
+        logger.debug("converting %s to html format to %s" % (self.path, self.outputdir))
+        _, extname = os.path.splitext(self.path)
+        viewtype = "normal"
+        if extname in ('.pdf', '.doc', '.wps', '.csv', '.prn', '.xls', '.et', '.ppt', '.dps', '.txt', '.rtf'):
+            if os.path.exists(self.outputdir):
+                self.threadpool.submit(self.async_convert, self.api, viewtype)
+            else:
+                os.mkdir(self.outputdir)
+                self.threadpool.submit(self.async_convert, self.api, viewtype)
+        else:
+            logger.debug("not support format: %s" % extname)
+
 class KuaiPanFuse(LoggingMixIn, Operations):
 
     def __init__(self, api):
@@ -683,25 +726,23 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         self.rootfiles = []
         self.cwd = ''
         self.rlock = Lock()
-        self.quota = {"f_blocks":0, "f_bavail":0}
+        self.quota = {"f_blocks":0, "f_bavail":0, "totalspace":0, "usedspace":0}
         self.walked = False
         self.uploadqueue = {}
 
     def initkuaipan(self):
         localtree = self.loadtree()
-        logger.debug(localtree)
 
         if localtree: 
             self.fileprops = localtree
         else:
             logger.warn("no tree.db")
-
+        self.mkdir(config.get_virtual_convert_dir(), 0644)
         ThreadPool.instance().start()
         threadpool = ThreadPool.instance()
         threadpool.delay(self.setaccountinfo, 0)
         threadpool.peroidic(self.setaccountinfo, 300)
         threadpool.delay(self.updatefileprops, 1)
-
         
     def __call__(self, op, *args):
         try:
@@ -726,16 +767,21 @@ class KuaiPanFuse(LoggingMixIn, Operations):
             try:
                 _, quota = result
                 totalspace, usedspace = quota["quota_total"], quota["quota_used"]
+                # if usedspace != self.quota["usedspace"]:
+                    # ThreadPool.instance().delay(self.updatefileprops, 0)
+
                 availspace = totalspace - usedspace
                 self.quota["f_blocks"] = totalspace / BLOCK_SIZE
                 self.quota["f_bavail"] = availspace / BLOCK_SIZE
+                # self.quota["usedspace"] = usedspace
                 logger.debug("totalspace=%d, usedspace=%d" % (totalspace, usedspace))
             except:
-                pass
+               import traceback;traceback.print_exc()
 
         future = ThreadPool.instance().submit(FuseTask("accountinfo", self.api))
         result = future.get()
         logger.debug(result)
+
         updatediskquota(result)
 
     def updatefileprops(self):
@@ -844,7 +890,7 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         logger.debug("add %s to cache" % path)
         with self.rlock:
             if typecode == TYPE_FILE:
-                fileinfo = copy.copy(ROOT_ST_INFO)
+                fileinfo = copy(ROOT_ST_INFO)
                 fileinfo["st_mode"] = TYPE_FILE
                 fileinfo["st_nlink"] = 1
                 fileinfo["st_parent_dir"] = os.path.dirname(path)
@@ -853,7 +899,7 @@ class KuaiPanFuse(LoggingMixIn, Operations):
                     fileinfo["st_size"] = size
                 self.fileprops[path] = fileinfo
             else:
-                dirinfo = copy.copy(ROOT_ST_INFO)
+                dirinfo = copy(ROOT_ST_INFO)
                 dirinfo["st_parent_dir"] = os.path.dirname(path)
                 dirinfo["st_name"] = os.path.basename(path)
                 self.fileprops[path] = dirinfo
@@ -896,7 +942,14 @@ class KuaiPanFuse(LoggingMixIn, Operations):
             writetask.sendmesg("push_upload_file", (data, offset))
             self.fileprops[path]["st_size"] += len(data)
         else:
-            task = self.taskpool.upload_file(hashpath, self.api, path, filename, self.uploadqueue)
+            task = self.taskpool.upload_file(
+                        hashpath, 
+                        self.api, 
+                        path, 
+                        filename, 
+                        self.uploadqueue,
+                        handler=AfterUploadHandler(self.api, path, self)
+                    )
             task.sendmesg("start_upload_file", (data, offset))
             self.fileprops[path]["st_size"] = len(data)
         return len(data)    
@@ -950,7 +1003,6 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         with open(filename, "w") as treefile:
             from pickle import dump
             dump(self.fileprops, treefile)
-            logger.debug("dump ok" + str(self.fileprops))
 
     def destroy(self, path):
         '''called by fuse destory context'''
