@@ -8,6 +8,7 @@
 #****************************************************
 
 import os
+import re
 import hmac
 import time
 import pycurl
@@ -22,6 +23,24 @@ from os.path import expanduser
 from ConfigParser import ConfigParser
 from pkg_resources import resource_filename
 
+REG_PROXY = re.compile("^(socks5|socks4|http|https)://(.*):(\d+)$")
+
+class Meta(type):
+    def __new__(cls, name, bases, attrs):
+        from threading import Lock
+        attrs["_global_lock"] = Lock()
+        return super(Meta, cls).__new__(cls, name, bases, attrs)
+
+    def __init__(clsa, name, bases, attrs):
+        super(Meta, clsa).__init__(name, bases, attrs)
+
+    def instance(clas, *args, **kwargs):
+        with clas._global_lock:
+            if not hasattr(clas, "_instance"):
+                clas._instance = super(Meta, clas).__call__(*args, **kwargs)
+            return clas._instance    
+
+class Singleton(object): __metaclass__ = Meta
 
 def getlogger():
     import logging
@@ -195,13 +214,13 @@ class CopyOnWriteBuffer(object):
             return self.buff[self.readindex:self.readindex+n]
 
     def write(self, chunk):
-       self.buflist.append(chunk)
-       self._length += len(chunk)
-       newbuff = copy(self.buff)
-       newbuff += "".join(self.buflist)
-       self.buflist = []
-       with self.lock:
-           self.buff = newbuff
+           self.buflist.append(chunk)
+           self._length += len(chunk)
+           newbuff = copy(self.buff)
+           newbuff += "".join(self.buflist)
+           self.buflist = []
+           with self.lock:
+               self.buff = newbuff
 
     def seek(self, offset):
         assert offset < self.length, "offset cannot greater than length"
@@ -304,9 +323,28 @@ class httprequest(object):
         else:
             self.response.cachefile.write(chunk)
 
-    def setopt(self, url=None, verbose=False, nobody=False, headers=None, timeout=120, data=None, allow_redirect=False):
+    def setproxy(self, proxy):
+        if not proxy:
+            return
+        matchgroups = REG_PROXY.match(proxy)
+        if matchgroups:
+            proto, host, port = matchgroups.groups()
+            if proto not in ("socks5", "http"):
+                return
+            if proto == "socks5":
+                self.curl.setopt(pycurl.PROXYTYPE, pycurl.PROXYTYPE_SOCKS5_HOSTNAME)
+
+            self.curl.setopt(pycurl.PROXY, host + ":" + port)
+
+    def setopt(self, proxy=None, url=None, verbose=False, nobody=False, headers=None, timeout=120, data=None, allow_redirect=False):
+        '''
+        @proxy protocol://host:port eg: socks5://127.0.0.1:1080
+        '''
         assert url, "url not passed"
+        self.curl.setopt(pycurl.NOSIGNAL, 1)
         self.curl.setopt(pycurl.URL, url)
+
+        self.setproxy(proxy)
 
         if verbose:
                 self.curl.setopt(pycurl.VERBOSE, 1)
@@ -334,6 +372,8 @@ class httprequest(object):
 
         if allow_redirect:
             self.curl.setopt(pycurl.FOLLOWLOCATION, 1)
+            self.curl.setopt(pycurl.MAXREDIRS, 5) 
+            
 
     def post(self, url, **kwargs):
         data = kwargs["data"]
@@ -344,15 +384,28 @@ class httprequest(object):
         self.curl.perform()
         return self.response
 
-    def close(self):
-        self.curl.close()
-
     def get(self, url, **kwargs):
         assert url, "url must passed!"
         kwargs.update(dict(url=url))
         self.setopt(**kwargs)
         self.curl.perform()
         return self.response
+
+    def getandclose(self, url, **kwargs):
+        try:
+            return self.get(url, **kwargs)
+        except:
+            raise
+        finally:
+            self.curl.close()
+
+    def postandclose(self, url, **kwargs):
+        try:
+            return self.post(url, **kwargs)
+        except:
+            raise
+        finally:
+            self.curl.close()
 
 
 class HTTPSession(object):
@@ -376,10 +429,11 @@ class HTTPSession(object):
         return httprequest(curl=self.curl, cookiefile=self.cookiefile).post(url, **kwargs)
 
     def close(self):
-        self.curl.close()
+        if self.curl:
+            self.curl.close()
 
 def httpget(url, **kwargs):
-    return httprequest().get(url, **kwargs)
+    return httprequest().getandclose(url, **kwargs)
 
 def httppost(url, **kwargs):
     return httprequest().post(url, **kwargs)
@@ -500,22 +554,11 @@ class LRUCache(object):
             import cPickle as pickle
             self.cache = pickle.load(file(self.lruconfig))
 
-class SafeLRUCache(LRUCache):
+class SafeLRUCache(Singleton, LRUCache):
     
-    _instance_lock = RLock()
-
     def __init__(self):
         super(SafeLRUCache, self).__init__()
         self.lock = RLock()
-
-    
-    @staticmethod
-    def instance():
-        if not hasattr(SafeLRUCache, "_instance"):
-            with SafeLRUCache._instance_lock:
-                if not hasattr(SafeLRUCache, "_instance"):
-                    SafeLRUCache._instance = SafeLRUCache()
-        return SafeLRUCache._instance
 
     def set(self, key, value):
         with self.lock:
@@ -531,10 +574,8 @@ class SafeLRUCache(LRUCache):
             return super(SafeLRUCache, self).count()
 
 if __name__ == '__main__':
-    def notify():
-        print("got write event")
-
-    buff = CopyOnWriteBuffer()
-    session = HTTPSession()
-    session.get("http://www.v2ex.com", callback=notify, cachefile=buff)
-    print buff.read()
+    # print httpget("https://twitter.com", proxy="socks5://127.0.0.1:1082").text
+    # rangeheader = {"Range":"bytes=0-5823864"}
+    response = httpget("http://dldir1.qq.com/qqfile/qq/QQ6.1/11905/QQ6.1.exe",nobody=True)
+    print response.headers["Content-Length"]
+    print len(response.raw.read())

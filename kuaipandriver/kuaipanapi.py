@@ -16,7 +16,7 @@ import common
 import requests
 from functools import wraps
 import lxml.html as html
-from kuaipandriver.common import oauth_once_next, HTTPSession, httpget, config
+from common import oauth_once_next, HTTPSession, httpget, config, Singleton
 from requests.exceptions import RequestException
 
 next_oauth_once = oauth_once_next()
@@ -44,7 +44,7 @@ def catchexception(func):
     return catch    
 
 
-class KuaipanAPI(object):
+class KuaipanAPI(Singleton):
 
     VERSION = "1.0"
     SIG_METHOD = "HMAC-SHA1"

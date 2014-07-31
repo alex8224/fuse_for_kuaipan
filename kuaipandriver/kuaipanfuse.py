@@ -28,7 +28,7 @@ from hashlib import sha1
 from functools import partial
 from collections import deque
 from stat import S_IFDIR, S_IFREG
-from kuaipanapi import OpenAPIError, OpenAPIException
+from kuaipanapi import KuaipanAPI, OpenAPIError, OpenAPIException
 from threading import Thread, Condition, RLock as Lock
 from errno import ENOENT, EROFS, EEXIST, EIO
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn, fuse_get_context
@@ -91,9 +91,7 @@ class Future(object):
         return self.finished
 
 
-class ThreadPool(Thread):
-
-    _instance_lock = Lock()
+class ThreadPool(Singleton, Thread):
 
     def __init__(self):
         Thread.__init__(self)
@@ -108,15 +106,6 @@ class ThreadPool(Thread):
         self.condition = Condition(self.lock)
         self.setDaemon(True)
         self.initpool()
-
-    @staticmethod
-    def instance():
-        '''create singleton ThreadPool object'''
-        if not hasattr(ThreadPool, "_instance"):
-            with ThreadPool._instance_lock:
-                if not hasattr(ThreadPool, "_instance"):
-                    ThreadPool._instance = ThreadPool()
-        return ThreadPool._instance
 
 
     def initpool(self):
@@ -168,8 +157,7 @@ class ThreadPool(Thread):
         '''get future result'''
         if issubclass(callable_.__class__, Future):
             return callable_
-        else:
-            return worker
+        else: return worker
 
     def submit(self, callable_, *args, **kwargs):
 
@@ -438,7 +426,7 @@ class WalkAroundTreeTask(Future):
             except:
                 import traceback;traceback.print_exc()
 
-            
+        self.session.close()            
         return allfilesinfo
 
     def __call__(self, *args):
@@ -590,8 +578,8 @@ class DownloadTask(Thread):
     def run(self):
         if not self.fromcache:
             logger.debug("start download %s" % self.path)
+            session = HTTPSession()
             try:
-                session = HTTPSession()
                 urlresult = self.api.get_downloadurl(self.path, session)
                 if urlresult.status_code != 302:
                     raise OpenAPIException("get_download_url failed %s" % urlresult.text)
@@ -605,6 +593,8 @@ class DownloadTask(Thread):
                 logger.debug("download file error, reason is %s" % pyerror[1])
                 self.success = False
                 self.notify()
+            finally:
+                session.close()
         else:
             logger.debug("download file from cache")
 
@@ -717,8 +707,8 @@ class AfterUploadHandler(object):
 
 class KuaiPanFuse(LoggingMixIn, Operations):
 
-    def __init__(self, api):
-        self.api = api
+    def __init__(self):
+        self.api = KuaipanAPI.instance()
         self.root = "."
         self.fd = 0
         self.fileprops = {"/":ROOT_ST_INFO}
@@ -767,21 +757,15 @@ class KuaiPanFuse(LoggingMixIn, Operations):
             try:
                 _, quota = result
                 totalspace, usedspace = quota["quota_total"], quota["quota_used"]
-                # if usedspace != self.quota["usedspace"]:
-                    # ThreadPool.instance().delay(self.updatefileprops, 0)
-
                 availspace = totalspace - usedspace
                 self.quota["f_blocks"] = totalspace / BLOCK_SIZE
                 self.quota["f_bavail"] = availspace / BLOCK_SIZE
-                # self.quota["usedspace"] = usedspace
-                logger.debug("totalspace=%d, usedspace=%d" % (totalspace, usedspace))
             except:
                import traceback;traceback.print_exc()
 
         future = ThreadPool.instance().submit(FuseTask("accountinfo", self.api))
         result = future.get()
         logger.debug(result)
-
         updatediskquota(result)
 
     def updatefileprops(self):
@@ -1011,17 +995,15 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         logger.debug("fuse exited!")
 
 def main():
-    from kuaipandriver.common import getauthinfo, checkplatform
+    from common import getauthinfo, checkplatform
     checkplatform()
-    from kuaipandriver.kuaipanapi import KuaipanAPI
     from requests.exceptions import RequestException
-
 
     islogin = False
     while 1:
         try:
             mntpoint, key, secret, user, pwd = getauthinfo()
-            api = KuaipanAPI(mntpoint, key, secret, user, pwd)
+            KuaipanAPI.instance(mntpoint, key, secret, user, pwd)
             islogin = True
             break
         except RequestException:
@@ -1031,12 +1013,11 @@ def main():
                 deleteloginfo()
             else:
                 break
-
     try:
         if not islogin:
             return
         FUSE(
-                KuaiPanFuse(api), mntpoint, foreground=True, nothreads=False, 
+                KuaiPanFuse(), mntpoint, foreground=True, nothreads=False, 
                 debug=False, big_writes=True, gid=os.getgid(), uid=os.getuid(), 
                 umask='0133'
             )
