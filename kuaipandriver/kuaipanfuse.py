@@ -27,6 +27,7 @@ from Queue import Queue
 from hashlib import sha1
 from functools import partial
 from collections import deque
+from types import FunctionType
 from stat import S_IFDIR, S_IFREG
 from kuaipanapi import KuaipanAPI, OpenAPIError, OpenAPIException
 from threading import Thread, Condition, RLock as Lock
@@ -90,14 +91,21 @@ class Future(object):
     def is_finished(self):
         return self.finished
 
+class Callable(Future):
+    def __init__(self, callable_):
+        super(Callable, self).__init__()
+        self.callable_ = callable_
+
+    def __call__(self, *args, **kwargs):
+        return self.callable_(*args, **kwargs)
 
 class ThreadPool(Singleton, Thread):
 
     def __init__(self):
         Thread.__init__(self)
-        self.max_thread_num = int(config.get_max_thread_num())
-        self.free_thread_num = int(config.get_free_thread_num())
-        self.idle_seconds = int(config.get_idle_seconds())
+        self.max_thread_num = 300
+        self.free_thread_num = 200
+        self.idle_seconds = 30
         self.runflag = False
         self.freequeue = deque()
         self.busyqueue = deque()
@@ -113,6 +121,7 @@ class ThreadPool(Singleton, Thread):
             self.__createworker()
 
     def quit(self):
+
         '''wait for all busy task done'''''
         while 1:
             with self.condition:
@@ -136,8 +145,10 @@ class ThreadPool(Singleton, Thread):
     def __dotaskinworker(self, callable_, *args, **kwargs):
         worker = self.freequeue.popleft()
         self.busyqueue.append(worker)
+        if isinstance(callable_, FunctionType):
+            callable_ = Callable(callable_)
         worker.execute(callable_, *args, **kwargs)
-        return self.future(callable_, worker)
+        return callable_
 
     def delay(self, callable_, timeout):
         '''schedule a delay task'''
@@ -153,14 +164,8 @@ class ThreadPool(Singleton, Thread):
             _peroidicwrapper.callablefunc = callable_
             self.delayqueue.append((time.time(), interval, _peroidicwrapper))
 
-    def future(self, callable_, worker):
-        '''get future result'''
-        if issubclass(callable_.__class__, Future):
-            return callable_
-        else: return worker
-
     def submit(self, callable_, *args, **kwargs):
-
+        assert callable(callable_) , "not a callable object"
         with self.lock:
 
             idle_threadsize = len(self.freequeue)
@@ -175,14 +180,14 @@ class ThreadPool(Singleton, Thread):
                 return self.__dotaskinworker(callable_, *args, **kwargs)
 
             elif idle_threadsize == 0 and all_threadsize == self.max_thread_num:
-                logger.debug("no available thread, wait for notify...")
+                # logger.debug("no available thread, wait for notify...")
                 self.condition.wait()
                 return self.__dotaskinworker(callable_, *args, **kwargs)
 
     def taskdone(self, worker):
         with self.condition:
             self.condition.notify()
-            logger.debug("worker:(%s) task done" % str(worker))
+            # logger.debug("worker:(%s) task done" % str(worker))
             self.freequeue.append(worker)
             self.busyqueue.remove(worker)
             
@@ -261,25 +266,21 @@ class Worker(Thread, Future):
             else:
                 logger.error("no such method %s" % methodname)
 
-    def set_task_result(self, task, result):
-        if hasattr(task, "set_result"):
-            task.set_result(result)
 
     def runascallable(self, task, *args, **kwargs):
         try:
            self.status = "RUNNING"
            result = task(*args, **kwargs)
-           self.set_task_result(task, result)
+           task.set_result(result)
            self.status = "FREE"
            self.lastupdate = time.time()
         except Exception, taskex:
-           set_task_result(task, result)
-           self.status = "FREE"
-           logger.error(taskex)
+            logger.error(taskex)
+            task.set_result(taskex)
+            self.status = "FREE"
         finally:
            ThreadPool.instance().taskdone(self)
 
-        pass
 
     def run(self):
         while 1:

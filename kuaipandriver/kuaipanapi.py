@@ -389,15 +389,3 @@ def test_doc_convert():
     else:
         print "convert failed!"
         print result.text
-
-
-if __name__ == '__main__':
-    mnt, key, secret, user, pwd = "mnt", "xca7VJ6GeO55SkAy", "QVruRGfkfddnHk9C", "alex8224@126.com", "xtgdmjq"
-    api = KuaipanAPI(mnt, key, secret, user, pwd)
-    path, offset, length = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-    session = requests.Session()
-    url = api.get_downloadurl(session, path)
-    print url
-    # data =  "".join([data for data in api.download_file2(url, session, offset, length)])
-    # print data
-    # print len(data)

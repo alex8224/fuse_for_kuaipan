@@ -574,8 +574,37 @@ class SafeLRUCache(Singleton, LRUCache):
             return super(SafeLRUCache, self).count()
 
 if __name__ == '__main__':
+    from kuaipanfuse import ThreadPool
+    import requests
+    s1 = requests.Session()
+    def requestget(url):
+        print("getting url %s" % url)
+        if s1.get(url).status_code != 200:
+            print("requests error")
+
+    def get(url):
+        print("getting url %s" % url)
+        resp = httpget(url)
+        if resp.status_code != 200:
+            print("pycurl error %s, status_code %d" % (resp.text, resp.status_code))
+
+    urls = ["http://10.86.11.113/repo/index.xml" for x in range(100000)]
+    
+    threadpool = ThreadPool.instance()
+    threadpool.start()
+    tasks = []
+    for url in urls:
+        task = threadpool.submit(get, url) 
+        # task = threadpool.submit(requestget, url) 
+        tasks.append(task)
+
+    for task in tasks:
+        task.get()
+    
+    print("ok")
     # print httpget("https://twitter.com", proxy="socks5://127.0.0.1:1082").text
+
     # rangeheader = {"Range":"bytes=0-5823864"}
-    response = httpget("http://dldir1.qq.com/qqfile/qq/QQ6.1/11905/QQ6.1.exe",nobody=True)
-    print response.headers["Content-Length"]
-    print len(response.raw.read())
+    # response = httpget("http://dldir1.qq.com/qqfile/qq/QQ6.1/11905/QQ6.1.exe",nobody=True)
+    # print response.headers["Content-Length"]
+    # print len(response.raw.read())
