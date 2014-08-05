@@ -16,3 +16,43 @@ Fuse For KuaiPan
   5. 虚拟打印机， 上传office格式的文件到 `/convert/` 目录下会自动对上传的文档进行转换成网页格式并自动保存到指定的目录
   
   
+使用要求
+~~~~~~~~~
+
+  1. 有快盘的账号
+  
+  2. 在快盘创建了至少一个应用， 需要用到里面的 `consumer_key` 和 `consumer_secret`, 可以到 http://www.kuaipan.cn/developers/create.htm 进行创建。
+
+  3. 在创建好应用之后， 指定了自己的账号作为测试账号。
+  
+  
+安装
+~~~~~~
+
+  pip install kuaipandriver
+
+
+配置
+~~~~~~
+
+创建文件 config.json, 格式如下：
+
+.. code-block:: javascript
+
+  {
+  "mntpoint":"挂载点的路径",
+  "username": "登录快盘的账号",
+  "password": "登录密码",
+  "keylist": [
+          ["consumer_key", "consumer_secret"],
+          ...
+      ]
+  }
+
+
+启动
+~~~~~~
+
+  mount.kuaipan -c config.json
+  
+  
