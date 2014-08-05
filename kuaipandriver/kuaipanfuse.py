@@ -2,7 +2,7 @@
 # -*-coding:utf-8 -*-
 
 #********************************************************************************
-#Author: tony - birdaccp@gmail.com alex8224@gmail.com
+#Author: alex8224@gmail.com
 #Create by: 2013-08-17 12:53
 #Last modified: 2014-07-01
 #Filename: kuanpanfuse.py
@@ -13,6 +13,7 @@
 # 支持文档转换，以虚拟打印机的方式实现
 # 缩略图和版本功能未实现
 # todo
+# README.MD on github
 # 3. test host speed and using fastest connection download file
 #********************************************************************************
 
@@ -27,14 +28,14 @@ from Queue import Queue
 from hashlib import sha1
 from functools import partial
 from collections import deque
-from types import FunctionType
 from stat import S_IFDIR, S_IFREG
-from kuaipanapi import KuaipanAPI, OpenAPIError, OpenAPIException
-from threading import Thread, Condition, RLock as Lock
+from types import FunctionType, MethodType
 from errno import ENOENT, EROFS, EEXIST, EIO
+from threading import Thread, Condition, RLock as Lock
+from kuaipanapi import KuaipanAPI, OpenAPIError, OpenAPIException
 from fuse import FUSE, FuseOSError, Operations, LoggingMixIn, fuse_get_context
 
-logger = getlogger()
+logger = None
 TYPE_DIR = (S_IFDIR | 0644 )
 TYPE_FILE = (S_IFREG | 0644 )
 BLOCK_SIZE = 4096
@@ -44,7 +45,7 @@ CACHE_PATH = "/dev/shm/"
 ROOT_ST_INFO = {
         "st_mtime": timestamp(),
         "st_mode":  TYPE_DIR,
-        "st_size":  4096,
+        "st_size":  BLOCK_SIZE,
         "st_gid":   os.getgid(),
         "st_uid":   os.getuid(),
         "st_atime": timestamp(),
@@ -103,9 +104,9 @@ class ThreadPool(Singleton, Thread):
 
     def __init__(self):
         Thread.__init__(self)
-        self.max_thread_num = 300
-        self.free_thread_num = 200
-        self.idle_seconds = 30
+        self.max_thread_num = int(config.get_max_thread_num())
+        self.free_thread_num = int(config.get_free_thread_num())
+        self.idle_seconds = int(config.get_idle_seconds())
         self.runflag = False
         self.freequeue = deque()
         self.busyqueue = deque()
@@ -145,10 +146,14 @@ class ThreadPool(Singleton, Thread):
     def __dotaskinworker(self, callable_, *args, **kwargs):
         worker = self.freequeue.popleft()
         self.busyqueue.append(worker)
-        if isinstance(callable_, FunctionType):
+        if type(callable_) in (FunctionType, MethodType):
             callable_ = Callable(callable_)
+
         worker.execute(callable_, *args, **kwargs)
-        return callable_
+        if callable(callable_):
+            return callable_
+        else:
+            return worker
 
     def delay(self, callable_, timeout):
         '''schedule a delay task'''
@@ -165,9 +170,7 @@ class ThreadPool(Singleton, Thread):
             self.delayqueue.append((time.time(), interval, _peroidicwrapper))
 
     def submit(self, callable_, *args, **kwargs):
-        assert callable(callable_) , "not a callable object"
         with self.lock:
-
             idle_threadsize = len(self.freequeue)
             busy_threadsize = len(self.busyqueue)
             all_threadsize = idle_threadsize + busy_threadsize
@@ -180,14 +183,12 @@ class ThreadPool(Singleton, Thread):
                 return self.__dotaskinworker(callable_, *args, **kwargs)
 
             elif idle_threadsize == 0 and all_threadsize == self.max_thread_num:
-                # logger.debug("no available thread, wait for notify...")
                 self.condition.wait()
                 return self.__dotaskinworker(callable_, *args, **kwargs)
 
     def taskdone(self, worker):
         with self.condition:
             self.condition.notify()
-            # logger.debug("worker:(%s) task done" % str(worker))
             self.freequeue.append(worker)
             self.busyqueue.remove(worker)
             
@@ -275,6 +276,7 @@ class Worker(Thread, Future):
            self.status = "FREE"
            self.lastupdate = time.time()
         except Exception, taskex:
+            print "-=============", task
             logger.error(taskex)
             task.set_result(taskex)
             self.status = "FREE"
@@ -390,7 +392,7 @@ class WalkAroundTreeTask(Future):
             st_info = {
                         "st_mtime": to_timestamp(finfo["modify_time"]),
                         "st_mode":  TYPE_FILE if finfo["type"] == "file" else TYPE_DIR,
-                        "st_size":  int(finfo["size"]) if finfo["type"] == "file" else 4096,
+                        "st_size":  int(finfo["size"]) if finfo["type"] == "file" else BLOCK_SIZE,
                         "st_gid":   os.getgid(),
                         "st_uid":   os.getuid(),
                         "st_atime": timestamp(),
@@ -493,34 +495,16 @@ class DownloadTask(Thread):
         self.cachevalue = self.querycache()
         self.success = True
 
-    def hash1equal(self):
-        return True
-        # try:
-            # metainfo = self.api.metadata(path=self.path)
-            # logger.debug(metainfo.json())
-            # if metainfo.status_code == 200:
-                # metainfo = metainfo.json()
-                # localcachefile = "/tmp/" + self.cachekey 
-                # from hashlib import sha1
-                # localhash = sha1(file(localcachefile).read()).hexdigest().strip()
-                # return localhash == metainfo["sha1"]
-            # else:
-                # return False
-        # except (IOError, OpenAPIException) as ex:
-            # logger.error(ex)
-            # return False
-
     def querycache(self):
-        if self.hash1equal():
-            cachefile = self.cache.get(self.cachekey)
-            if cachefile:
-                try:
-                    value = cachefile.value
-                    self.fromcache = True
-                    return value
-                except IOError, ioe:
-                    logger.error(ioe)
-                    self.cache.remove(self.cachekey)
+        cachefile = self.cache.get(self.cachekey)
+        if cachefile:
+            try:
+                value = cachefile.value
+                self.fromcache = True
+                return value
+            except IOError, ioe:
+                logger.error(ioe)
+                self.cache.remove(self.cachekey)
 
     def savetocache(self, data):
         diskcachefile = DiskCacheable()
@@ -584,7 +568,7 @@ class DownloadTask(Thread):
                 urlresult = self.api.get_downloadurl(self.path, session)
                 if urlresult.status_code != 302:
                     raise OpenAPIException("get_download_url failed %s" % urlresult.text)
-                downloadurl = urlresult.headers["Location"]
+                downloadurl = urlresult.headers["location"]
                 self.api.download_file2(downloadurl, self.notify, self.cachefile, session)
             except (OpenAPIError, OpenAPIException) as openex:
                 logger.debug(openex)
@@ -608,8 +592,6 @@ class WriteTask(object):
         self.path = path
         self.filename = filename
         self.fullpath = CACHE_PATH + hashpath
-        self.writebytes = 0
-        self.filesize = 0
         self.uploadqueue = uploadqueue
         self.clsname = "_" + self.__class__.__name__
         self.afteruploadhandler = handler 
@@ -679,6 +661,9 @@ class AfterUploadHandler(object):
         self.fuse = fuse
 
     def async_convert(self, api, viewtype):
+        if not os.path.exists(self.outputdir):
+            os.mkdir(self.outputdir)
+
         fullpath = os.path.join(self.outputdir, os.path.basename(self.path)) + ".zip"
         result = api.convert(self.path, viewtype)
         if result.status_code == 200:
@@ -698,11 +683,7 @@ class AfterUploadHandler(object):
         _, extname = os.path.splitext(self.path)
         viewtype = "normal"
         if extname in ('.pdf', '.doc', '.wps', '.csv', '.prn', '.xls', '.et', '.ppt', '.dps', '.txt', '.rtf'):
-            if os.path.exists(self.outputdir):
-                self.threadpool.submit(self.async_convert, self.api, viewtype)
-            else:
-                os.mkdir(self.outputdir)
-                self.threadpool.submit(self.async_convert, self.api, viewtype)
+            self.threadpool.submit(self.async_convert, self.api, viewtype)
         else:
             logger.debug("not support format: %s" % extname)
 
@@ -995,30 +976,48 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         SafeLRUCache.instance().save()
         logger.debug("fuse exited!")
 
-def main():
-    from common import getauthinfo, checkplatform
-    checkplatform()
-    from requests.exceptions import RequestException
+def parse_options():
+    from optparse import OptionParser
+    parser = OptionParser()
+    parser.add_option("-c", "--configfile", dest="configfile", help="special config file fullpath")
+    parser.add_option("-f", "--foreground", dest="foreground", default=False, action="store_true", help="do not fork into background.")
+    parser.add_option("-d", "--log-level", dest="debuglevel", default="ERROR", help="log level FATAL|ERROR|WARN|DEBUG|INFO")
+    parser.add_option("-l", "--log-file-path", dest="logpath", default="/tmp/kuaipanfuse.log", help="path to log file")
 
-    islogin = False
-    while 1:
-        try:
-            mntpoint, key, secret, user, pwd = getauthinfo()
-            KuaipanAPI.instance(mntpoint, key, secret, user, pwd)
-            islogin = True
-            break
-        except RequestException:
-            retry = raw_input("Your Login info already wrong, do you want to re enter it?(Y/N)")
-            if retry == "Y":
-                from kuaipandriver.common import deleteloginfo
-                deleteloginfo()
-            else:
-                break
+    (options, args) = parser.parse_args()
+
+    if not options.configfile:
+        parser.print_help()
+    else:
+        return options
+
+def parse_config(configfile):
+    if not os.path.exists(configfile):
+        print("configfile %s not existed!" % configfile)
+        sys.exit(1)
+    from json import load
     try:
-        if not islogin:
-            return
+        cfg = load(file(configfile))
+        define(mntpoint=cfg["mntpoint"], user=cfg["username"], pwd=cfg["password"], keylist=cfg["keylist"])
+    except ValueError:
+        print("config file format error")
+        sys.exit(1)
+        
+def main():
+    from common import checkplatform, Context
+    checkplatform()
+    options = parse_options()
+    if not options:
+        return
+
+    parse_config(options.configfile)
+    global logger
+    logger = getlogger(logfile=options.logpath, level=options.debuglevel)
+
+    try:
+        mntpoint = Context.instance().mntpoint
         FUSE(
-                KuaiPanFuse(), mntpoint, foreground=True, nothreads=False, 
+                KuaiPanFuse(), mntpoint, foreground=options.foreground, nothreads=False, 
                 debug=False, big_writes=True, gid=os.getgid(), uid=os.getuid(), 
                 umask='0133'
             )

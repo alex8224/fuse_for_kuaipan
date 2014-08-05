@@ -16,21 +16,26 @@ import common
 import requests
 from functools import wraps
 import lxml.html as html
-from common import oauth_once_next, HTTPSession, httpget, config, Singleton
+from common import oauth_once_next, HTTPSession, httpget, config, Singleton, Context
 from requests.exceptions import RequestException
 
 next_oauth_once = oauth_once_next()
+
+context = Context.instance()
 
 def handler(signum, frame):
     print "use press ctrl+c exit"
     sys.exit(0)
 signal.signal(signal.SIGINT, handler)
 
+
 class OpenAPIError(Exception):
     def __init__(self, exception, traceobj):
         super(OpenAPIError, self).__init__(exception, None, traceobj)
 
+
 class OpenAPIException(Exception):pass
+
 
 def catchexception(func):
 
@@ -49,32 +54,23 @@ class KuaipanAPI(Singleton):
     VERSION = "1.0"
     SIG_METHOD = "HMAC-SHA1"
 
-    APILIST = (
-                ("xchAnjnCdbjAmDVG", "xIb1iRVWEusFasLk"), 
-                ("xcpSzCqMAAMAXVX0", "Ghx1HeZNT6KCaFyt"), 
-                ("xcLZ52biN0IfmIj7", "xKRhasdyj11VmjDT"), 
-                ("xclSX19bD5JW86NZ", "QALDvUVZ8NvTYHbD"),
-                ("xca7VJ6GeO55SkAy", "QVruRGfkfddnHk9C") 
-            )
-
-
-    def __init__(self, mntpoint, key, secret, user, pwd):
-        self.mntpoint = mntpoint
+    def __init__(self):
+        self.mntpoint = context.mntpoint
         self.consumer_key = ''
         self.consumer_secret = ''
-        self.auth_user = user
-        self.auth_pwd = pwd
+        self.auth_user = context.user
+        self.auth_pwd = context.pwd
+        self.applist = context.keylist
         self.keylist = self.getapikey()
         self.login()
 
     def getapikey(self):
-        for key, secret in KuaipanAPI.APILIST:
-            yield key, secret 
+        for key, secret in self.applist:
+            yield str(key), str(secret) 
 
     def login(self):
         try:
            self.consumer_key, self.consumer_secret =  self.keylist.next()
-           print("got next key and secret from api pool (%s, %s)" % (self.consumer_key, self.consumer_secret))
         except StopIteration:
             raise OpenAPIException("no more api secret and key can be used!")
 
@@ -127,17 +123,16 @@ class KuaipanAPI(Singleton):
 
     def get_auth_code(self, url):
         try:
-            ua = "Mozilla/5.0 (X11; Linux i686) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.153 Safari/537.36"
             sess = HTTPSession()
             referer = url
-            step1_request = sess.get(url, verbose=True)
+            step1_request = sess.get(url)
             htdoc = html.fromstring(step1_request.text)
             s, app_name, oauth_token = htdoc.xpath("//input[@type='hidden']")
             post_payload = {"username":self.auth_user, "userpwd":self.auth_pwd,"s":s.value, "app_name":app_name.value, "oauth_token":oauth_token.value}
-            headers = {"User-Agent":ua,"Referer":referer, "Host":"www.kuaipan.cn"}
+            headers = {"Referer":referer, "Host":"www.kuaipan.cn"}
             posturl = "https://www.kuaipan.cn/api.php?ac=open&op=authorisecheck"
 
-            step2_request = sess.post(posturl, data=post_payload,headers=headers, verbose=True)
+            step2_request = sess.post(posturl, data=post_payload,headers=headers)
             htdoc = html.fromstring(step2_request.text)
             msg = htdoc.xpath("//strong")[0].text
             if not msg.isdigit():
@@ -218,17 +213,7 @@ class KuaipanAPI(Singleton):
     def get_downloadurl(self, filepath, session):
         attach = {"path":filepath, "root":"app_folder"}
         sig_req_url = self.__get_sig_url("download", attachdata=attach)
-        return session.get(sig_req_url, verbose=True)
-        # downloadurl = result.headers["Location"]
-        # print "before url %s" % downloadurl
-        # import re
-        # urlpatter = re.compile('^(http://)(p\d+)(.*)$')
-        # urlarray = urlpatter.split(downloadurl)[1:-1]
-        # urlarray[1] = 'p6'
-        # downloadurl = "".join(urlarray)
-        # print "after url %s" % downloadurl
-        # return downloadurl
-        # return result.headers["Location"]
+        return session.get(sig_req_url)
 
     @catchexception
     @retrylogin
@@ -269,7 +254,6 @@ class KuaipanAPI(Singleton):
         import subprocess
         from subprocess import PIPE
         cmd = '''curl -D /dev/stdout -F "filedata=@%s" "%s"''' % (fullpath, upload_url)
-        print cmd
         p = subprocess.Popen(cmd, stdout=PIPE,stderr=PIPE, shell=True)
         upload_result = p.wait()
         print("using curl to upload file %s with filename %s" % (fullpath, filename))
@@ -316,10 +300,10 @@ class KuaipanAPI(Singleton):
         doctype = path[-3:]
         attach = {"type":doctype, "view":viewtype, "root":"app_folder", "path":path, "zip":1}
         sig_req_url = self.__get_sig_url("convert", attachdata=attach)
-        session = HTTPSession(cookiefile="convertcookie.txt")
+        session = HTTPSession()
         convertreq = session.get(sig_req_url)
         if convertreq.status_code == 302:
-            converturl = convertreq.headers["Location"]
+            converturl = convertreq.headers["location"]
             return session.get(converturl)
         else:
             return convertreq

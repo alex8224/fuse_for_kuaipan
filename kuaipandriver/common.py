@@ -5,6 +5,8 @@
 # Last modified: 2014-07-08 11:45
 # Filename: common.py
 # Description:
+# tolist
+# post data, upload file, async client? requests 兼容?
 #****************************************************
 
 import os
@@ -13,17 +15,19 @@ import hmac
 import time
 import pycurl
 import base64
-import urllib
 import hashlib
 import traceback
 from copy import copy
 from threading import RLock
 from os.path import expanduser
-
+from Cookie import SimpleCookie
 from ConfigParser import ConfigParser
 from pkg_resources import resource_filename
+from urllib import quote as uquote, quote_plus, urlencode
+
 
 REG_PROXY = re.compile("^(socks5|socks4|http|https)://(.*):(\d+)$")
+REG_COOKIE = re.compile("(.*)=([^;]*)")
 
 class Meta(type):
     def __new__(cls, name, bases, attrs):
@@ -42,18 +46,27 @@ class Meta(type):
 
 class Singleton(object): __metaclass__ = Meta
 
-def getlogger():
+class Context(Singleton):pass
+
+def define(**kwargs):
+    context = Context.instance()
+    for k,v in kwargs.iteritems():
+        setattr(context, k, v)
+
+def getlogger(logfile=None, level="DEBUG"):
     import logging
     from logging import handlers
+    levels = {"INFO":logging.INFO, "DEBUG":logging.DEBUG, "WARN":logging.WARN,"ERROR":logging.ERROR, "FATAL":logging.FATAL}
     logger = logging.getLogger("kuaipanserver")
-    hdlr = logging.StreamHandler()
-    fdlr = handlers.TimedRotatingFileHandler("kuaipan_fuse.log", 'D', backupCount=30)
     format = logging.Formatter("%(asctime)s %(filename)s[line:%(lineno)d] %(levelname)s - %(message)s", "%Y-%m-%d %H:%M:%S")
+    hdlr = logging.StreamHandler()
     logger.addHandler(hdlr)
-    logger.addHandler(fdlr)
     hdlr.setFormatter(format)
-    fdlr.setFormatter(format)
-    logger.setLevel(logging.DEBUG)
+    if logfile:
+        fdlr = handlers.TimedRotatingFileHandler(logfile, 'D', backupCount=30)
+        logger.addHandler(fdlr)
+        fdlr.setFormatter(format)
+    logger.setLevel(levels[level])
     return logger
 
 
@@ -115,7 +128,7 @@ def to_string(a):
 
 def quote(s):
     s = to_string(s)
-    return urllib.quote(s, '~')
+    return uquote(s, '~')
 
 def generate_signature(base_uri, parameters, key, http_method='get'):
     s = ''
@@ -142,51 +155,6 @@ def safe_value(v):
         return v.encode('utf-8')
     else:
         return v
-
-def getauthinfo():
-    '''get login information from local disk or stdin'''
-    from kuaipandriver.common import getloginfromlocal
-    loginfo = getloginfromlocal()
-    if loginfo:
-        return loginfo
-
-    mntpoint = raw_input("MountPoint(Absoluate Path):")
-    key = raw_input("ConsumerKey:")
-    secret = raw_input("ConsumerSecret:")
-    username = raw_input("Kuaipan Login Name:")
-    from getpass import getpass
-    pwd = getpass("Kuaipan Password:")
-    return mntpoint, key, secret, username, pwd
-
-def getloginfromlocal():
-    '''get login information from local disk'''
-    infofilepath= os.path.expanduser("~") + "/.kuaipandriver"
-    if os.path.exists(infofilepath):
-        import pickle
-        return pickle.load(file(infofilepath))
-
-def savelogin(mntpoint, key, secret, username, pwd):
-    '''save login information to home directory ~/.kuaipandriver'''
-    import os
-    infofilepath = expanduser("~") + "/.kuaipandriver"
-    if os.path.exists(infofilepath):
-        return
-    save = raw_input("Do you want save your login info?(Y/N)")
-    if save == "Y":
-        infofilepath = os.path.expanduser("~")+ "/.kuaipandriver"
-        with open(infofilepath, "w") as infofile:
-            info = (mntpoint, key, secret, username, pwd )
-            import pickle
-            pickle.dump(info, infofile)
-            print("your login info saved in path %s" % infofilepath)
-
-
-def deleteloginfo():
-    infofilepath = expanduser("~")+ "/.kuaipandriver"
-    try:
-        os.unlink(infofilepath)
-    except:
-        pass
 
 def checkplatform():
     import sys
@@ -249,6 +217,7 @@ class response(object):
         self._status_code = -1
         self._cachefile = CopyOnWriteBuffer()
         self._headers = {}
+        self.cookieobj = SimpleCookie()
         self._body = None
 
     def __str__(self):
@@ -282,33 +251,56 @@ class response(object):
         import json
         return json.loads(self._cachefile.read()) 
 
+class HttpException(Exception):pass
 
 class httprequest(object):
-    def __init__(self, curl=None, cookiefile=None, callback=None, cachefile=None):
+    def __init__(self, curl=None, callback=None, cachefile=None):
         self.curl = curl if curl else pycurl.Curl()
-        self.cookiefile = cookiefile if cookiefile else ''
         self.response = response()
         self.writecallback = callback
         self.cachefile = cachefile
+        self.cookiedict = {}
+        self.ua = "Mozilla/5.0 (X11; Linux i686) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.153 Safari/537.36"
 
     def _header2curlstyle(self, headers):
         return map(lambda h:(h[0] +": " + h[1]), headers.iteritems())
     
     def _dict2urlfields(self, payfields):
-        return "&".join(["%s=%s" % (item[0],item[1]) for item in payfields.iteritems()])
+        return urlencode(payfields)
 
     def parserstatus(self, statusline):
         s1 = statusline.find(" ")
         schema, self.response.status_code = statusline[0:s1], int(statusline[s1+1:s1+4])
 
+    def parsecookies(self, cookie):
+        self.response.cookieobj.load(cookie)
+
+    def setcookies(self, cookies):
+        cookiedict = {}
+
+        if cookies:
+            cookiedict.update(cookies)
+
+        self.cookiedict = cookiedict    
+
+        cookielist = "".join(map(lambda key: "%s=%s;" % (quote_plus(key), quote_plus(cookiedict[key])), cookiedict.iterkeys()))
+
+        if self.cookiedict:
+            self.curl.setopt(pycurl.COOKIE, cookielist)
+        else:
+            self.curl.setopt(pycurl.COOKIELIST, "")
+
     def parseheader(self, header):
+        if not header:
+            return
         header = header.strip()
         firstsep = header.find(":")
         if firstsep>-1:
-            headername = header[0:firstsep]
+            headername = header[0:firstsep].lower()
             headervalue = header[firstsep+2:]
             self.response.headers[headername] = headervalue
-
+            if headername.lower() == "set-cookie":
+                self.parsecookies(headervalue)
 
     def headerfunc(self, header):
         if header.startswith("HTTP"):
@@ -336,37 +328,67 @@ class httprequest(object):
 
             self.curl.setopt(pycurl.PROXY, host + ":" + port)
 
-    def setopt(self, proxy=None, url=None, verbose=False, nobody=False, headers=None, timeout=120, data=None, allow_redirect=False):
+    def setopt(self, method='GET', ua='', cookies=None, proxy=None, url=None, verbose=False, headers=None, timeout=120, data=None, allow_redirect=False):
         '''
         @proxy protocol://host:port eg: socks5://127.0.0.1:1080
         '''
-        assert url, "url not passed"
-        self.curl.setopt(pycurl.NOSIGNAL, 1)
+        self.curl.reset()
+        method = method.upper() 
+
+        if method not in ("GET", "POST", "DELETE", "PUT", "OPTIONS", "HEAD"):
+            raise pycurl.error("not support method:%s" % method)
+
+        if method in ("HEAD", "DELETE"):
+            self.curl.setopt(pycurl.NOBODY, False)
+
+        if method in ("POST", "PUT"):
+            self.curl.setopt(pycurl.POST, True)
+
+        if method in ("PUT", "DELETE", "PUT", "OPTIONS"):
+            self.curl.setopt(pycurl.CUSTOMREQUEST, method)
+
+        self.curl.setopt(pycurl.NOSIGNAL, True)
         self.curl.setopt(pycurl.URL, url)
 
         self.setproxy(proxy)
-
+        
         if verbose:
-                self.curl.setopt(pycurl.VERBOSE, 1)
-        if nobody:
-                self.curl.setopt(pycurl.NOBODY, 1)
+                self.curl.setopt(pycurl.VERBOSE, True)
+
+        allheaders = []
+
+        self.setcookies(cookies)
 
         if headers:
             curl_headers = self._header2curlstyle(headers)
-            self.curl.setopt(pycurl.HTTPHEADER, curl_headers)
+            allheaders.extend(curl_headers)
 
-        if data:
+        if ua:
+            self.ua = ua
+
+        allheaders.extend(["User-Agent: %s" % self.ua])
+
+        if allheaders:
+            self.curl.setopt(pycurl.HTTPHEADER, allheaders)
+
+        if method in ("POST", "PUT"):
             if isinstance(data, str):
-                #direct post str as body 
-                pass
+                self.curl.setopt(pycurl.POSTFIELDS, data)
+            elif hasattr(data, "read"):
+                self.curl.setopt(pycurl.UPLOAD, True)
+                self.curl.setopt(pycurl.READFUNCTION, data.read)
+                data.seek(0, 2)
+                filesize = data.tell()
+                data.seek(0)
+                self.curl.setopt(pycurl.INFILESIZE, filesize)
             elif isinstance(data, dict):
                 postfields = self._dict2urlfields(data)
                 self.curl.setopt(pycurl.POSTFIELDS, postfields)
 
         self.curl.setopt(pycurl.TIMEOUT, timeout)
-        if self.cookiefile:
-            self.curl.setopt(pycurl.COOKIEJAR, self.cookiefile)
-            self.curl.setopt(pycurl.COOKIEFILE, self.cookiefile)
+        # if self.cookiefile:
+            # self.curl.setopt(pycurl.COOKIEJAR, self.cookiefile)
+            # self.curl.setopt(pycurl.COOKIEFILE, self.cookiefile)
         self.curl.setopt(pycurl.HEADERFUNCTION, self.headerfunc)
         self.curl.setopt(pycurl.WRITEFUNCTION, self.contentfunc)
 
@@ -374,22 +396,31 @@ class httprequest(object):
             self.curl.setopt(pycurl.FOLLOWLOCATION, 1)
             self.curl.setopt(pycurl.MAXREDIRS, 5) 
             
+    def _method(self, methodname, url, **kwargs):
+        try:
+            kwargs.update(dict(url=url, method=methodname))
+            self.setopt(**kwargs)
+            self.curl.perform()
+            return self.response
+        except pycurl.error, error:
+            raise HttpException(error)
 
     def post(self, url, **kwargs):
-        data = kwargs["data"]
-        assert data, "post must have data field"
-        assert url, "url must passed!"
-        kwargs.update(dict(url=url))
-        self.setopt(**kwargs)
-        self.curl.perform()
-        return self.response
+        assert "data" in kwargs, "post must have data field"
+        return self._method("POST", url, **kwargs)
 
     def get(self, url, **kwargs):
-        assert url, "url must passed!"
-        kwargs.update(dict(url=url))
-        self.setopt(**kwargs)
-        self.curl.perform()
-        return self.response
+        return self._method("GET", url, **kwargs)
+
+    def delete(self, url, **kwargs):
+        return self._method("DELETE", url, **kwargs)
+
+    def put(self, url, **kwargs):
+        assert "data" in kwargs, "put must have data field"
+        return self._method("PUT", url, **kwargs)
+
+    def head(self, url, **kwargs):
+        return self._method("HEAD", url, **kwargs)
 
     def getandclose(self, url, **kwargs):
         try:
@@ -407,26 +438,25 @@ class httprequest(object):
         finally:
             self.curl.close()
 
-
 class HTTPSession(object):
 
-    def __init__(self, cookiefile="cookies.txt"):
+    def __init__(self):
         self.curl = pycurl.Curl()
-        self.cookiefile = cookiefile
 
-    def _resetsession(self):
-        self.curl.reset()
-    
     def get(self, url, callback=None, cachefile=None, **kwargs):
-        self._resetsession()
-        if callback and cachefile:
-            return httprequest(curl=self.curl, cookiefile=self.cookiefile, callback=callback, cachefile=cachefile).get(url, **kwargs)
-        else:
-            return httprequest(curl=self.curl, cookiefile=self.cookiefile).get(url, **kwargs)
+        return httprequest(curl=self.curl, callback=callback, cachefile=cachefile).get(url, **kwargs)
 
     def post(self, url, **kwargs):
-        self._resetsession()
-        return httprequest(curl=self.curl, cookiefile=self.cookiefile).post(url, **kwargs)
+        return httprequest(curl=self.curl).post(url, **kwargs)
+
+    def put(self, url, **kwargs):
+        return httprequest(curl=self.curl).put(url, **kwargs)
+    
+    def delete(self, url, **kwargs):
+        return httprequest(curl=self.curl).delete(url, **kwargs)
+
+    def head(self, url, **kwargs):
+        return httprequest(curl=self.curl).head(url, **kwargs)
 
     def close(self):
         if self.curl:
@@ -572,39 +602,3 @@ class SafeLRUCache(Singleton, LRUCache):
     def count(self):
         with self.lock:
             return super(SafeLRUCache, self).count()
-
-if __name__ == '__main__':
-    from kuaipanfuse import ThreadPool
-    import requests
-    s1 = requests.Session()
-    def requestget(url):
-        print("getting url %s" % url)
-        if s1.get(url).status_code != 200:
-            print("requests error")
-
-    def get(url):
-        print("getting url %s" % url)
-        resp = httpget(url)
-        if resp.status_code != 200:
-            print("pycurl error %s, status_code %d" % (resp.text, resp.status_code))
-
-    urls = ["http://10.86.11.113/repo/index.xml" for x in range(100000)]
-    
-    threadpool = ThreadPool.instance()
-    threadpool.start()
-    tasks = []
-    for url in urls:
-        task = threadpool.submit(get, url) 
-        # task = threadpool.submit(requestget, url) 
-        tasks.append(task)
-
-    for task in tasks:
-        task.get()
-    
-    print("ok")
-    # print httpget("https://twitter.com", proxy="socks5://127.0.0.1:1082").text
-
-    # rangeheader = {"Range":"bytes=0-5823864"}
-    # response = httpget("http://dldir1.qq.com/qqfile/qq/QQ6.1/11905/QQ6.1.exe",nobody=True)
-    # print response.headers["Content-Length"]
-    # print len(response.raw.read())
