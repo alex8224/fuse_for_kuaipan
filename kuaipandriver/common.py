@@ -223,6 +223,9 @@ class response(object):
     def __str__(self):
         return "[Response %d]" % self.status_code
 
+    def __repr__(self):
+        return "[Response %d]" % self.status_code
+        
     @property
     def status_code(self):
         return self._status_code
@@ -255,12 +258,16 @@ class HttpException(Exception):pass
 
 class httprequest(object):
     def __init__(self, curl=None, callback=None, cachefile=None):
-        self.curl = curl if curl else pycurl.Curl()
+        self._curl = curl if curl else pycurl.Curl()
         self.response = response()
         self.writecallback = callback
         self.cachefile = cachefile
         self.cookiedict = {}
         self.ua = "Mozilla/5.0 (X11; Linux i686) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/35.0.1916.153 Safari/537.36"
+
+    @property
+    def curlhandler(self):
+        return self._curl
 
     def _header2curlstyle(self, headers):
         return map(lambda h:(h[0] +": " + h[1]), headers.iteritems())
@@ -286,9 +293,9 @@ class httprequest(object):
         cookielist = "".join(map(lambda key: "%s=%s;" % (quote_plus(key), quote_plus(cookiedict[key])), cookiedict.iterkeys()))
 
         if self.cookiedict:
-            self.curl.setopt(pycurl.COOKIE, cookielist)
+            self._curl.setopt(pycurl.COOKIE, cookielist)
         else:
-            self.curl.setopt(pycurl.COOKIELIST, "")
+            self._curl.setopt(pycurl.COOKIELIST, "")
 
     def parseheader(self, header):
         if not header:
@@ -324,36 +331,36 @@ class httprequest(object):
             if proto not in ("socks5", "http"):
                 return
             if proto == "socks5":
-                self.curl.setopt(pycurl.PROXYTYPE, pycurl.PROXYTYPE_SOCKS5_HOSTNAME)
+                self._curl.setopt(pycurl.PROXYTYPE, pycurl.PROXYTYPE_SOCKS5_HOSTNAME)
 
-            self.curl.setopt(pycurl.PROXY, host + ":" + port)
+            self._curl.setopt(pycurl.PROXY, host + ":" + port)
 
     def setopt(self, method='GET', ua='', cookies=None, proxy=None, url=None, verbose=False, headers=None, timeout=120, data=None, allow_redirect=False):
         '''
         @proxy protocol://host:port eg: socks5://127.0.0.1:1080
         '''
-        self.curl.reset()
+        self._curl.reset()
         method = method.upper() 
 
         if method not in ("GET", "POST", "DELETE", "PUT", "OPTIONS", "HEAD"):
             raise pycurl.error("not support method:%s" % method)
 
         if method in ("HEAD", "DELETE"):
-            self.curl.setopt(pycurl.NOBODY, False)
+            self._curl.setopt(pycurl.NOBODY, False)
 
         if method in ("POST", "PUT"):
-            self.curl.setopt(pycurl.POST, True)
+            self._curl.setopt(pycurl.POST, True)
 
         if method in ("PUT", "DELETE", "PUT", "OPTIONS"):
-            self.curl.setopt(pycurl.CUSTOMREQUEST, method)
+            self._curl.setopt(pycurl.CUSTOMREQUEST, method)
 
-        self.curl.setopt(pycurl.NOSIGNAL, True)
-        self.curl.setopt(pycurl.URL, url)
+        self._curl.setopt(pycurl.NOSIGNAL, True)
+        self._curl.setopt(pycurl.URL, url)
 
         self.setproxy(proxy)
         
         if verbose:
-                self.curl.setopt(pycurl.VERBOSE, True)
+                self._curl.setopt(pycurl.VERBOSE, True)
 
         allheaders = []
 
@@ -369,41 +376,46 @@ class httprequest(object):
         allheaders.extend(["User-Agent: %s" % self.ua])
 
         if allheaders:
-            self.curl.setopt(pycurl.HTTPHEADER, allheaders)
+            self._curl.setopt(pycurl.HTTPHEADER, allheaders)
 
         if method in ("POST", "PUT"):
             if isinstance(data, str):
-                self.curl.setopt(pycurl.POSTFIELDS, data)
+                self._curl.setopt(pycurl.POSTFIELDS, data)
             elif hasattr(data, "read"):
-                self.curl.setopt(pycurl.UPLOAD, True)
-                self.curl.setopt(pycurl.READFUNCTION, data.read)
+                self._curl.setopt(pycurl.UPLOAD, True)
+                self._curl.setopt(pycurl.READFUNCTION, data.read)
                 data.seek(0, 2)
                 filesize = data.tell()
                 data.seek(0)
-                self.curl.setopt(pycurl.INFILESIZE, filesize)
+                self._curl.setopt(pycurl.INFILESIZE, filesize)
             elif isinstance(data, dict):
                 postfields = self._dict2urlfields(data)
-                self.curl.setopt(pycurl.POSTFIELDS, postfields)
+                self._curl.setopt(pycurl.POSTFIELDS, postfields)
 
-        self.curl.setopt(pycurl.TIMEOUT, timeout)
+        self._curl.setopt(pycurl.TIMEOUT, timeout)
         # if self.cookiefile:
-            # self.curl.setopt(pycurl.COOKIEJAR, self.cookiefile)
-            # self.curl.setopt(pycurl.COOKIEFILE, self.cookiefile)
-        self.curl.setopt(pycurl.HEADERFUNCTION, self.headerfunc)
-        self.curl.setopt(pycurl.WRITEFUNCTION, self.contentfunc)
+            # self._curl.setopt(pycurl.COOKIEJAR, self.cookiefile)
+            # self._curl.setopt(pycurl.COOKIEFILE, self.cookiefile)
+        self._curl.setopt(pycurl.HEADERFUNCTION, self.headerfunc)
+        self._curl.setopt(pycurl.WRITEFUNCTION, self.contentfunc)
 
         if allow_redirect:
-            self.curl.setopt(pycurl.FOLLOWLOCATION, 1)
-            self.curl.setopt(pycurl.MAXREDIRS, 5) 
+            self._curl.setopt(pycurl.FOLLOWLOCATION, 1)
+            self._curl.setopt(pycurl.MAXREDIRS, 5) 
             
     def _method(self, methodname, url, **kwargs):
         try:
             kwargs.update(dict(url=url, method=methodname))
             self.setopt(**kwargs)
-            self.curl.perform()
+            self._curl.perform()
             return self.response
         except pycurl.error, error:
             raise HttpException(error)
+
+    def lazymethod(self, methodname, url, **kwargs):
+        kwargs.update(dict(url=url, method=methodname))
+        self.setopt(**kwargs)
+        return self
 
     def post(self, url, **kwargs):
         assert "data" in kwargs, "post must have data field"
@@ -428,7 +440,7 @@ class httprequest(object):
         except:
             raise
         finally:
-            self.curl.close()
+            self._curl.close()
 
     def postandclose(self, url, **kwargs):
         try:
@@ -436,7 +448,50 @@ class httprequest(object):
         except:
             raise
         finally:
-            self.curl.close()
+            self._curl.close()
+
+class BatchRequest(object):
+
+    def __init__(self):
+        self._handler_pool= pycurl.CurlMulti()
+        self._response = []
+
+    def _method(self, methodname, url, **kwargs):
+        req = httprequest()
+        self._handler_pool.add_handle(req.lazymethod(methodname, url, **kwargs).curlhandler)
+        self._response.append(req.response)
+
+    def get(self, url , **kwargs):
+        return self._method("GET", url, **kwargs)
+
+    def post(self, url, **kwargs):
+        return self._method("POST", url, **kwargs)
+
+    def head(self, url, **kwargs):
+        return self._method("HEAD", url, **kwargs)
+
+    def put(self, url, **kwargs):
+        return self._method("PUT", url, **kwargs)
+
+    def delete(self, url, **kwargs):
+        return self._method("DELET", url, **kwargs)
+
+    def run(self):
+        while 1:
+            ret, num_handles = self._handler_pool.perform()
+            if ret != pycurl.E_CALL_MULTI_PERFORM: break
+        while num_handles:
+            ret = self._handler_pool.select(1.0)
+            if ret == -1: continue
+            while 1:
+                ret, num_handles = self._handler_pool.perform()
+                if ret != pycurl.E_CALL_MULTI_PERFORM: break
+   
+    def runinbackground(self):
+        pass
+
+    def get_result(self):
+        return self._response
 
 class HTTPSession(object):
 
@@ -602,3 +657,15 @@ class SafeLRUCache(Singleton, LRUCache):
     def count(self):
         with self.lock:
             return super(SafeLRUCache, self).count()
+
+if __name__ == '__main__':
+    asyncrequest = BatchRequest()
+    urls = ["http://www.163.com", "http://www.qq.com"]
+
+    for url in urls:
+        asyncrequest.get(url)
+
+    asyncrequest.run()    
+    print asyncrequest.get_result()
+    for rep in asyncrequest.get_result():
+        print rep.headers

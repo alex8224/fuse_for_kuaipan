@@ -104,9 +104,342 @@ class ThreadPool(Singleton, Thread):
 
     def __init__(self):
         Thread.__init__(self)
-        self.max_thread_num = int(config.get_max_thread_num())
-        self.free_thread_num = int(config.get_free_thread_num())
-        self.idle_seconds = int(config.get_idle_seconds())
+        # self.max_thread_num = int(config.get_max_thread_num())
+        # self.free_thread_num = int(config.get_free_thread_num())
+        # self.idle_seconds = int(config.get_idle_seconds())
+        self.max_thread_num = 10
+        self.free_thread_num = 10
+        self.idle_seconds = 30
+        self.runflag = False
+        self.freequeue = deque()
+        self.busyqueue = deque()
+        self.delayqueue = deque()
+        self.lock = Lock()
+        self.condition = Condition(self.lock)
+        self.setDaemon(True)
+        self.initpool()
+
+
+    def initpool(self):
+        for workerindex in range(self.free_thread_num):
+            self.__createworker()
+
+    def quit(self):
+
+        '''wait for all busy task done'''''
+        while 1:
+            with self.condition:
+                if len(self.busyqueue) > 0:
+                    self.condition.wait()
+                else:
+                    break
+
+        for task in self.freequeue:
+            task.quit()
+            task.waitdone()
+            
+        with self.lock:
+            self.runflag = False    
+
+    def __createworker(self):
+        worker = Worker()
+        self.freequeue.append(worker)
+        return worker
+
+    def __dotaskinworker(self, callable_, *args, **kwargs):
+        worker = self.freequeue.popleft()
+        self.busyqueue.append(worker)
+        if type(callable_) in (FunctionType, MethodType):
+            callable_ = Callable(callable_)
+
+        worker.execute(callable_, *args, **kwargs)
+        if callable(callable_):
+            return callable_
+        else:
+            return worker
+
+    def delay(self, callable_, timeout):
+        '''schedule a delay task'''
+        with self.lock:
+            self.delayqueue.append((time.time(), timeout, callable_))
+
+    def peroidic(self, callable_, interval):
+        '''schedual a peroidic task'''
+        def _peroidicwrapper():
+            self.delay(callable_, interval)
+
+        with self.lock:
+            _peroidicwrapper.callablefunc = callable_
+            self.delayqueue.append((time.time(), interval, _peroidicwrapper))
+
+    def submit(self, callable_, *args, **kwargs):
+        with self.lock:
+            idle_threadsize = len(self.freequeue)
+            busy_threadsize = len(self.busyqueue)
+            all_threadsize = idle_threadsize + busy_threadsize
+
+            if idle_threadsize > 0:
+                return self.__dotaskinworker(callable_, *args, **kwargs)
+
+            elif idle_threadsize == 0 and all_threadsize < self.max_thread_num:
+                self.__createworker()
+                return self.__dotaskinworker(callable_, *args, **kwargs)
+
+            elif idle_threadsize == 0 and all_threadsize == self.max_thread_num:
+                self.condition.wait()
+                return self.__dotaskinworker(callable_, *args, **kwargs)
+
+    def taskdone(self, worker):
+        with self.condition:
+            self.condition.notify()
+            self.freequeue.append(worker)
+            self.busyqueue.remove(worker)
+            
+
+    def run(self):
+        lastcleantime = time.time()
+        self.runflag = True
+        while self.runflag:
+            with self.lock:
+                if time.time() - lastcleantime > self.idle_seconds:
+                    needcleantasknum = len(self.freequeue) - self.free_thread_num
+                    for workerindex in range(needcleantasknum):
+                        task = self.freequeue.pop()
+                        task.quit()
+                    
+                    lastcleantime = time.time()
+
+                delaytasks = filter(lambda task: time.time() - task[0] > task[1], self.delayqueue)
+                for delaytask in delaytasks:
+                    callable_ = delaytask[2]
+                    timeoutvalue = delaytask[1]
+                    callable_()
+                    self.delayqueue.remove(delaytask)
+                    if hasattr(callable_, "callablefunc"):
+                        self.peroidic(callable_.callablefunc, timeoutvalue)
+
+            
+            time.sleep(0.1)
+
+class Worker(Thread, Future):
+    def __init__(self):
+        Thread.__init__(self)
+        Future.__init__(self)
+        self.status = "FREE"
+        self.taskqueue = Queue(2)
+        self.lastupdate = time.time()
+        self.notify = lambda noop:noop
+        self.tasktype = "callable"
+        self.setDaemon(True)
+        self.start()
+        self.interactivequeue = Queue()
+
+
+    def sendmesg(self, methodname, mesg):
+        self.interactivequeue.put((methodname,mesg))
+
+    def execute(self, callable_, *args, **kwargs):
+        self.status = "BUSY"
+        taskinfo = ("DO_TASK", callable_, args, kwargs)
+        self.taskqueue.put(taskinfo)
+
+    def quit(self):
+        self.taskqueue.put(("QUIT", None, None, None))
+
+    def waitdone(self):
+        while 1:
+            with self.waitobj:
+                if self.status == "QUIT":
+                    break
+                else:
+                    self.waitobj.wait()
+
+    def runasinteractive(self, task):
+
+        self.status = "RUNNING"
+        while 1:
+            methodname, args = self.interactivequeue.get()
+            if methodname == "end_task":
+                self.status = "FREE"
+                self.lastupdate = time.time()
+                ThreadPool.instance().taskdone(self)
+                break
+            if hasattr(task, methodname):
+                method = getattr(task, methodname)
+                method(*args)
+            else:
+                logger.error("no such method %s" % methodname)
+
+
+    def runascallable(self, task, *args, **kwargs):
+        try:
+           self.status = "RUNNING"
+           result = task(*args, **kwargs)
+           task.set_result(result)
+           self.status = "FREE"
+           self.lastupdate = time.time()
+        except Exception, taskex:
+            print "-=============", task
+            logger.error(taskex)
+            task.set_result(taskex)
+            self.status = "FREE"
+        finally:
+           ThreadPool.instance().taskdone(self)
+
+
+    def run(self):
+        while 1:
+            cmd, task, args, kwargs = self.taskqueue.get()
+            if cmd == "QUIT":
+                self.status = "QUIT"
+                self.lastupdate = time.time()
+                break
+            else:
+                if callable(task):
+                    self.runascallable(task, *args, **kwargs)
+                else:
+                    self.runasinteractive(task)
+                    
+                   
+class TaskPool(object):
+    def __init__(self):
+        self.uploadpool = {}
+        self.downloadpool = {}
+        self.uploadlock, self.downlock = Lock(), Lock()
+        self.taskclass = {"upload":WriteTask, "download":DownloadTask}
+
+    def upload_file(self, hashpath, *args, **kwargs):
+        params = list(args)
+        params.insert(1, hashpath)
+        task = ThreadPool.instance().submit(WriteTask(*params, **kwargs))
+        self.uploadpool[hashpath] = task
+        return task
+
+    def delete_upload_task(self, key):
+        if key in self.uploadpool:
+            del self.uploadpool[key]
+
+    def delete_download_task(self, key):
+        if key in self.downloadpool:
+            del self.downloadpool[key]
+
+    def download_file(self, hashpath, *args):
+        return self.__new_task("download", hashpath, *args)
+
+    def __task_sucess(self, tasktype, key, result=None, callback=None):
+        lock = self.__getlock(tasktype)
+        with lock:
+            logger.debug("task %s already complted!, delete it!" % key)
+            pool = self.__getpool(tasktype)
+            if callback:
+                logger.debug("call callback method, the result is:%s" % str(result))
+                callback(result)
+
+            if pool.has_key(key):
+                del pool[key]
+
+    def __getlock(self, tasktype):
+        return self.uploadlock if tasktype == "upload" else self.downlock
+
+    def __getpool(self, tasktype):
+        return self.uploadpool if tasktype == "upload" else self.downloadpool
+
+    def __new_task(self, tasktype, key, *args, **kwargs):
+        if kwargs and "callback" in kwargs:
+            callback_wrapper = partial(self.__task_sucess, tasktype, key, callback=kwargs["callback"])
+        else:
+            callback_wrapper = partial(self.__task_sucess, tasktype, key)
+        taskparams = list(args)
+        taskparams.insert(1, key)
+        taskparams.extend([callback_wrapper])
+        task = self.taskclass[tasktype](*taskparams)
+        with self.__getlock(tasktype):
+            pool = self.__getpool(tasktype)
+            pool[key] = task
+            task.start()
+            return task
+
+    def query_upload_task(self, key):
+        return self.__query_task("upload", key)
+
+    def query_download_task(self, key):
+        return self.__query_task("download", key)
+
+    def __query_task(self, tasktype, key):
+        with self.__getlock(tasktype):
+            pool = self.__getpool(tasktype)
+            if pool.has_key(key):
+               return pool[key]
+
+class WalkAroundTreeTask(Future):
+
+    def __init__(self, api, path):
+        Future.__init__(self)
+        self.api = api
+        self.path = path
+        self.session = HTTPSession()
+
+    def readdir(self, path):
+        return self.api.metadata(path=path, session=self.session)
+
+    def listdir(self, path, allfilesinfo):
+        dirs = []
+        result = self.readdir(path)
+        if result.status_code != 200:
+            return dirs
+
+        result = result.json()
+        for finfo in result["files"]:
+            fullpath = os.path.join(path, finfo["name"])
+
+            st_info = {
+                        "st_mtime": to_timestamp(finfo["modify_time"]),
+                        "st_mode":  TYPE_FILE if finfo["type"] == "file" else TYPE_DIR,
+                        "st_size":  int(finfo["size"]) if finfo["type"] == "file" else BLOCK_SIZE,
+                        "st_gid":   os.getgid(),
+                        "st_uid":   os.getuid(),
+                        "st_atime": timestamp(),
+                        "st_parent_dir": path,
+                        "st_name": finfo["name"]
+                    }
+
+            allfilesinfo[fullpath] = st_info
+
+            print("%s" % fullpath)
+            if finfo["type"] == "file":
+                dirs.append((fullpath, "file"))
+            else:
+                dirs.append((fullpath, "dir"))
+        return dirs        
+
+    def walk(self, root):
+        stack = []
+        stack.append(root)
+        allfilesinfo = {}
+
+        while 1:
+            if len(stack) == 0:
+                break
+            cwd = stack.pop(0)
+            try:
+                files = self.listdir(cwd, allfilesinfo)
+                for fileinfo in files:
+                    name, nodetype = fileinfo
+                    path = os.path.join(cwd, name)
+
+                    if nodetype == "dir":
+                        stack.append(path)
+            except:
+                import traceback;traceback.print_exc()
+
+        self.session.close()            
+        return allfilesinfo
+
+    def __call__(self, *args):
+        return self.walk(self.path)                
+
+class FuseTask(Future):
+    def __init__(self, method, api, *args, **kwargs):
         self.runflag = False
         self.freequeue = deque()
         self.busyqueue = deque()
