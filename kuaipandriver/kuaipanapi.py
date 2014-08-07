@@ -14,13 +14,13 @@ import urllib
 import signal
 import common
 import requests
-from functools import wraps
 import lxml.html as html
-from common import oauth_once_next, HTTPSession, httpget, config, Singleton, Context
+from functools import wraps
+from httputils import HTTPSession, httpget
 from requests.exceptions import RequestException
+from common import oauth_once_next, config, Singleton, Context
 
 next_oauth_once = oauth_once_next()
-
 context = Context.instance()
 
 def handler(signum, frame):
@@ -78,8 +78,6 @@ class KuaipanAPI(Singleton):
         authorize_url = self.authorize()
         auth_code = self.get_auth_code(authorize_url)
         self.access_token(auth_code)
-        from kuaipandriver.common import savelogin
-        savelogin(self.mntpoint, self.consumer_key, self.consumer_secret, self.auth_user, self.auth_pwd)
 
     def retrylogin(func):
 
@@ -202,7 +200,7 @@ class KuaipanAPI(Singleton):
     @catchexception
     @retrylogin
     def metadata(self,root="app_folder", path="", session=None):
-        sig_req_url = self.__get_sig_url("metadata", urlsuffix=(root, urllib.quote(path.encode("utf-8"))))
+        sig_req_url = self.__get_sig_url("metadata", urlsuffix = (root, urllib.quote(path.encode("utf-8"))))
         if session:
             return session.get(sig_req_url)
         else:
