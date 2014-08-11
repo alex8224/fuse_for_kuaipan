@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="kuaipandriver",
-    version='0.5',
+    version='0.6',
     keywords = ["fuse", "kuaipan", "network driver", "mount"],
     license='MIT',
     description="A network driver's fuse Implementation base on kingsoft's kuaipan api",
@@ -23,6 +23,7 @@ setup(
     test.apidaylimit = kuaipandriver.kuaipanapi:test_api_limit
     test.docconvert= kuaipandriver.kuaipanapi:test_doc_convert
     test.fileupload= kuaipandriver.kuaipanapi:test_file_upload
+    kuaipan.sync = kuaipandriver.kuaipansync:main
     """,
     classifiers=[
         'License :: OSI Approved :: MIT License',
