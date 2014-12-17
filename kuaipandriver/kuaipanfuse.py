@@ -169,7 +169,6 @@ class WalkAroundTreeTask(Future):
 
             allfilesinfo[fullpath] = st_info
 
-            print("%s" % fullpath)
             if finfo["type"] == "file":
                 dirs.append((fullpath, "file"))
             else:
@@ -480,8 +479,11 @@ class KuaiPanFuse(LoggingMixIn, Operations):
         ThreadPool.instance().start()
         threadpool = ThreadPool.instance()
         threadpool.delay(self.setaccountinfo, 0)
+	#get netdisk space info every 300s
         threadpool.peroidic(self.setaccountinfo, 300)
         threadpool.delay(self.updatefileprops, 1)
+	#sync file list every 60s
+        threadpool.peroidic(self.updatefileprops, 300)
         
     def __call__(self, op, *args):
         try:
